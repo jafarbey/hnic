@@ -15,7 +15,7 @@ carries out the allowed work itself.
 From this folder, one command:
 
 ```
-python3 hnic.py --policy examples/policy.hnic --script examples/demo.hnic --root test-folder --auto-approve
+python3 hnic.py --policy examples/policy.hnic --script examples/demo.hnic --root test-folder --auto-approve --execute
 ```
 
 The demo is the ten-minute flow from Chapter 3: search one folder, share
@@ -24,10 +24,21 @@ read, to show the folder-scoped DENY rule working. `--auto-approve`
 answers the approval prompt for you; leave it off and the runtime stops
 and asks you in the terminal.
 
+## Dry run is the default
+
+The book promises the examples run read-only unless the reader says
+otherwise, and the toy keeps that promise: without `--execute`, the
+runtime checks the policy, prints the decision and what it would do,
+and logs it as `dry-run`, but it changes nothing. SEARCH and READ still
+run in a dry run, because they change nothing. COPY, MOVE, DELETE,
+RENAME, and SHARE are only described. Add `--execute` to actually
+perform the allowed actions.
+
 ## What each file does
 
 - `hnic.py` — the runtime. Reads a policy file and a script, checks every
   statement against the policy *before* acting, and writes the audit trail.
+- `test_hnic.py` — the tests (stdlib unittest only). Run `python3 test_hnic.py`.
 - `examples/policy.hnic` — the policy, in HNIC: search is allowed in
   `/clients`, sharing needs approval, delete and copy are denied, reading
   `/finance` is denied.
@@ -35,8 +46,9 @@ and asks you in the terminal.
 - `test-folder/` — the folder the statements act on: a client file, a
   contract, a finance folder with a salary sheet, a tax return.
 - `audit.log` — created when you run it. One append-only line per
-  statement: when it ran, the statement, and the decision (allowed /
-  denied / approved-by-human / needs-model).
+  statement: when it ran, the statement, the decision, and who approved
+  it (`-` when nobody did). The line is written *before* the action
+  runs, so a crash still leaves the record.
 - `DEMO-TRANSCRIPT.md` — the recorded output of a real demo run.
 
 ## How the decision works
@@ -47,6 +59,18 @@ For every statement, in this order:
 2. A matching REQUIRE rule stops and asks a human.
 3. A matching ALLOW rule lets it run.
 4. No matching rule refuses it. Silence is not permission.
+
+COPY and MOVE are checked twice: the folder the file comes from and the
+folder it goes to. RENAME is checked for both folders too. Every path is
+resolved once, with realpath, against the real root folder, and that same
+resolved path is used for the policy check and the action — so a `..` or
+a symlink cannot slip a file past the rules. A path that escapes the
+root folder is denied, never acted on.
+
+Approvals are recorded with a name on them: `--approver NAME` names the
+approver (the login name when not given). `--auto-approve` records
+`auto-approved`, never `approved-by-human`, because no human approved
+anything.
 
 ## Honest limits
 

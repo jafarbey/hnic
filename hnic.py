@@ -16,7 +16,20 @@ files runs through the rules.
 Usage:
     python3 hnic.py --policy examples/policy.hnic \
                     --script examples/demo.hnic \
-                    --root test-folder [--auto-approve]
+                    --root test-folder --auto-approve --execute
+
+By default the runtime runs DRY: it checks the policy, prints the
+decision and what it would do, and logs it as dry-run, but it changes
+nothing. Add --execute to actually perform the allowed actions. The
+examples in the book run read-only unless the reader says otherwise,
+and this is how the toy keeps that promise. SEARCH and READ still run
+in a dry run, because they change nothing; COPY, MOVE, DELETE, RENAME
+and SHARE are only described, never done.
+
+Paths are resolved ONCE, with realpath, against the real root folder,
+and that same resolved path is used for both the policy check and the
+action. A path that escapes the root — through ".." or through a
+symlink — is denied, never acted on.
 
 Policy lines (one rule per line, plain words):
     ALLOW SEARCH files IN /clients
@@ -44,11 +57,22 @@ Decision order for every statement:
     3. A matching ALLOW rule lets it run.
     4. No matching rule refuses it. Silence is not permission.
 
+COPY and MOVE are checked twice: once for the folder the file comes
+from, once for the folder it goes to. RENAME is checked for the folder
+the file sits in and the folder the new name lands in.
+
+The audit trail is written BEFORE the action runs, so a crash still
+leaves the record. An approval is recorded with the name of the person
+who approved it (--approver, or the login name when not given).
+--auto-approve records "auto-approved", never "approved-by-human",
+because no human approved anything.
+
 SUMMARIZE and EXTRACT are stubs: they print that they need a language
 model behind them and do not pretend to work.
 """
 
 import argparse
+import getpass
 import os
 import shutil
 import sys
@@ -64,16 +88,13 @@ VERBS = {
 # Verbs that need a language model behind them. The toy has none.
 NEEDS_MODEL = {"SUMMARIZE", "EXTRACT"}
 
+# Verbs that change something. In a dry run they are only described.
+MUTATING = {"SHARE", "COPY", "MOVE", "DELETE", "RENAME"}
+
 
 def clean_path(text):
     """Turn a written path like /clients/x.txt into a plain relative path."""
     return text.strip().strip("/")
-
-
-def folder_of(path):
-    """The folder a file path lives in, or / for the root."""
-    parent = os.path.dirname(clean_path(path))
-    return "/" + parent if parent else "/"
 
 
 def inside(child, parent):
@@ -157,22 +178,19 @@ class Statement:
         self.args = args  # the remaining words, split
 
     def target_folder(self):
-        """The folder this statement touches, for policy matching."""
-        if self.verb == "SEARCH":
-            # SEARCH files IN /clients  (or plain SEARCH files)
-            if "IN" in [w.upper() for w in self.args]:
-                idx = [w.upper() for w in self.args].index("IN")
-                return "/" + clean_path(self.args[idx + 1])
-            return "/"
-        # Every other verb names a file first: its folder governs it.
-        return folder_of(self.args[0])
-
-    def target_path(self):
-        return self.args[0] if self.args else ""
+        """The folder a SEARCH statement names, as written."""
+        if "IN" in [w.upper() for w in self.args]:
+            idx = [w.upper() for w in self.args].index("IN")
+            return "/" + clean_path(self.args[idx + 1])
+        return "/"
 
 
 def parse_script(path):
-    """Read a script file into a list of Statements."""
+    """Read a script file into a list of Statements.
+
+    A line the language does not know is kept, not rejected: the run
+    denies it as an unknown statement and carries on.
+    """
     statements = []
     with open(path) as f:
         for number, raw in enumerate(f, 1):
@@ -186,15 +204,158 @@ def parse_script(path):
                 # stop and ask a human before going on.
                 statements.append(Statement(line, "REQUIRE", []))
                 continue
-            if verb not in VERBS:
-                die(f"{path}:{number}: unknown statement {verb!r}")
             statements.append(Statement(line, verb, words[1:]))
     return statements
 
 
 def die(message):
+    """Stop the whole run. Only for setup errors: a missing or
+    unreadable policy or script file, a malformed policy line, or a
+    missing root folder. The policy is the safety core — a half-read
+    policy must not run. A bad path or a bad statement in the script
+    is denied and the run carries on; that is a decision, not a
+    setup error."""
     print(f"hnic: {message}", file=sys.stderr)
     sys.exit(2)
+
+
+def find_keyword(args, word):
+    """Index of `word` in args, matching case-insensitively, or -1."""
+    upper = [w.upper() for w in args]
+    return upper.index(word) if word in upper else -1
+
+
+def validate(statement):
+    """Return an error string when the statement is incomplete or
+    unknown, else None. A bad statement is denied, never a crash."""
+    verb, args = statement.verb, statement.args
+    if verb == "REQUIRE":
+        return None
+    if verb not in VERBS:
+        return f"unknown statement {verb!r}"
+    if verb == "SEARCH":
+        idx = find_keyword(args, "IN")
+        if idx == len(args) - 1:
+            return "SEARCH names IN but no folder follows it"
+        return None
+    if verb in ("READ", "DELETE", "SUMMARIZE", "EXTRACT"):
+        if not args:
+            return f"{verb} names no file"
+        return None
+    if verb == "SHARE":
+        if not args:
+            return "SHARE names no file"
+        idx = find_keyword(args, "WITH")
+        if idx < 0 or idx == len(args) - 1:
+            return "SHARE needs WITH <person>"
+        return None
+    if verb in ("COPY", "MOVE", "RENAME"):
+        if not args:
+            return f"{verb} names no file"
+        idx = find_keyword(args, "TO")
+        if idx <= 0 or idx == len(args) - 1:
+            return f"{verb} needs TO <destination>"
+        return None
+    return None
+
+
+def resolve_path(root, path):
+    """Resolve a written path once, against the real root folder.
+
+    realpath settles ".." and follows symlinks, so the resolved path
+    is the file that would actually be touched. Returns the resolved
+    absolute path, or None when it escapes the root.
+    """
+    joined = os.path.realpath(os.path.join(root, clean_path(path)))
+    base = os.path.realpath(root)
+    if os.path.commonpath([joined, base]) != base:
+        return None
+    return joined
+
+
+def policy_folder(root, resolved, is_folder=False):
+    """The folder a resolved path belongs to, for policy matching."""
+    rel = os.path.relpath(resolved, root)
+    if is_folder:
+        return "/" + rel if rel != "." else "/"
+    parent = os.path.dirname(rel)
+    return "/" + parent if parent else "/"
+
+
+def resolve_statement(statement, root):
+    """Resolve every path a statement touches, once.
+
+    Returns (paths, error): paths is {"target": resolved path,
+    "dest": resolved destination or None}; error is a string when a
+    path escapes the root, else None. The same resolved paths are
+    used for the policy check and for the action.
+    """
+    verb, args = statement.verb, statement.args
+    paths = {"target": None, "dest": None}
+    if verb == "SEARCH":
+        folder = statement.target_folder()
+        resolved = resolve_path(root, folder)
+        if resolved is None:
+            return None, f"folder escapes the folder: {folder!r}"
+        paths["target"] = resolved
+        return paths, None
+    target = resolve_path(root, args[0])
+    if target is None:
+        return None, f"path escapes the folder: {args[0]!r}"
+    paths["target"] = target
+    if verb in ("COPY", "MOVE"):
+        dest = resolve_path(root, args[find_keyword(args, "TO") + 1])
+        if dest is None:
+            return None, ("destination escapes the folder: "
+                          f"{args[find_keyword(args, 'TO') + 1]!r}")
+        paths["dest"] = dest
+    elif verb == "RENAME":
+        new_name = args[find_keyword(args, "TO") + 1]
+        dest = resolve_path(
+            root, os.path.join(os.path.dirname(args[0]), new_name))
+        if dest is None:
+            return None, f"new name escapes the folder: {new_name!r}"
+        paths["dest"] = dest
+    return paths, None
+
+
+def check_pairs(statement, paths, root):
+    """The (verb, folder) pairs this statement must pass.
+
+    COPY and MOVE are checked for the folder the file comes from and
+    the folder it goes to. RENAME is checked for the folder the file
+    sits in and the folder the new name lands in.
+    """
+    verb = statement.verb
+    if verb == "SEARCH":
+        return [(verb, policy_folder(root, paths["target"],
+                                     is_folder=True))]
+    pairs = [(verb, policy_folder(root, paths["target"]))]
+    if paths["dest"] is not None:
+        if verb in ("COPY", "MOVE"):
+            pairs.append((verb, policy_folder(root, paths["dest"],
+                                              is_folder=True)))
+        elif verb == "RENAME":
+            pairs.append((verb, policy_folder(root, paths["dest"])))
+    return pairs
+
+
+def check_pair(rules, verb, folder):
+    """One (verb, folder) check, without asking anyone.
+
+    Returns (outcome, reason): outcome is "deny", "require",
+    "allow", or "none" (no rule speaks to it).
+    """
+    for rule in rules:
+        if rule.kind == "DENY" and rule.matches(verb, folder):
+            return "deny", f"policy says {rule}"
+    for rule in rules:
+        if rule.kind == "REQUIRE" and rule.matches(verb, folder):
+            return "require", f"policy says {rule}"
+    for rule in rules:
+        if rule.kind == "ALLOW" and rule.matches(verb, folder):
+            return "allow", f"policy says {rule}"
+    return "none", "no rule allows it"
 
 
 def ask_human(statement, auto_approve):
@@ -211,118 +372,237 @@ def ask_human(statement, auto_approve):
     return answer in ("y", "yes")
 
 
-def decide(rules, statement, auto_approve):
-    """Check one statement against the policy. Returns (decision, reason).
+def decide(rules, pairs, statement, auto_approve, approver, dry_run):
+    """Check the pairs against the policy.
 
-    Decisions: allowed, denied, approved-by-human, needs-model.
+    Returns (decision, reason, approver): decision is "allowed",
+    "denied", "approved-by-human", "auto-approved", or, in a dry
+    run, "needs-approval" when a human would have been asked.
+    Approver is the name recorded on an approval, else None.
     """
-    verb = statement.verb
-    folder = statement.target_folder()
+    outcomes = [check_pair(rules, verb, folder)
+                for verb, folder in pairs]
 
     # 1. A matching DENY rule refuses it.
-    for rule in rules:
-        if rule.kind == "DENY" and rule.matches(verb, folder):
-            return "denied", f"policy says {rule}"
+    for outcome, reason in outcomes:
+        if outcome == "deny":
+            return "denied", reason, None
 
-    # 2. A matching REQUIRE rule stops and asks a human.
-    for rule in rules:
-        if rule.kind == "REQUIRE" and rule.matches(verb, folder):
-            if ask_human(statement, auto_approve):
-                return "approved-by-human", f"human approved ({rule})"
-            return "denied", "human said no"
+    # 2. A matching REQUIRE rule stops and asks a human. In a dry
+    #    run nothing will happen, so nobody is asked.
+    required = [reason for outcome, reason in outcomes
+                if outcome == "require"]
+    if required:
+        if dry_run:
+            return "needs-approval", \
+                f"would stop and ask a human ({required[0]})", None
+        if ask_human(statement, auto_approve):
+            if auto_approve:
+                return "auto-approved", \
+                    f"auto-approved for the demo ({required[0]})", \
+                    approver
+            return "approved-by-human", \
+                f"human approved ({required[0]})", approver
+        return "denied", "human said no", None
 
-    # 3. A matching ALLOW rule lets it run.
-    for rule in rules:
-        if rule.kind == "ALLOW" and rule.matches(verb, folder):
-            return "allowed", f"policy says {rule}"
+    # 3. Silence is not permission: every pair needs an ALLOW.
+    for outcome, reason in outcomes:
+        if outcome == "none":
+            return "denied", reason, None
 
-    # 4. No matching rule refuses it. Silence is not permission.
-    return "denied", "no rule allows it"
-
-
-def safe_join(root, path):
-    """Join a written path to the root folder, refusing escapes."""
-    joined = os.path.normpath(os.path.join(root, clean_path(path)))
-    base = os.path.normpath(root)
-    if os.path.commonpath([joined, base]) != base:
-        die(f"path escapes the folder: {path!r}")
-    return joined
+    # 4. Every pair is allowed.
+    return "allowed", outcomes[0][1], None
 
 
-def run_statement(statement, root):
-    """Carry out an allowed statement against the real folder."""
+def decide_checkpoint(statement, auto_approve, approver, dry_run):
+    """A bare REQUIRE approval line: stop and ask, or note it."""
+    if dry_run:
+        return "needs-approval", "would stop and ask a human", None
+    if ask_human(statement, auto_approve):
+        if auto_approve:
+            return "auto-approved", "auto-approved for the demo", \
+                approver
+        return "approved-by-human", "human approved the checkpoint", \
+            approver
+    return "denied", "human said no", None
+
+
+def would_do(statement):
+    """Plain words for what a mutating statement would do."""
+    verb, args = statement.verb, statement.args
+    if verb == "SHARE":
+        idx = find_keyword(args, "WITH")
+        person = " ".join(args[idx + 1:]) if idx >= 0 else "someone"
+        return f"share {args[0]} with {person}"
+    if verb in ("COPY", "MOVE"):
+        idx = find_keyword(args, "TO")
+        dest = args[idx + 1] if idx >= 0 else "?"
+        action = "copy" if verb == "COPY" else "move"
+        return f"{action} {args[0]} to {dest}"
+    if verb == "DELETE":
+        return f"delete {args[0]}"
+    if verb == "RENAME":
+        idx = find_keyword(args, "TO")
+        new = args[idx + 1] if idx >= 0 else "?"
+        return f"rename {args[0]} to {new}"
+    return statement.raw.lower()
+
+
+def run_statement(statement, root, paths):
+    """Carry out an allowed statement. Paths are already resolved."""
     verb = statement.verb
     args = statement.args
 
     if verb == "SEARCH":
-        folder = statement.target_folder()
-        full = safe_join(root, folder)
+        full = paths["target"]
         if not os.path.isdir(full):
-            print(f"  Folder {folder} not found.")
+            print(f"  Folder {statement.target_folder()} not found.")
             return
         found = []
         for dirpath, _dirs, files in os.walk(full):
             for name in sorted(files):
-                found.append(os.path.relpath(
+                found.append("/" + os.path.relpath(
                     os.path.join(dirpath, name), root))
         if not found:
-            print(f"  Nothing in {folder}.")
+            print(f"  Nothing in {statement.target_folder()}.")
         for path in found:
-            print(f"  /{path}")
+            print(f"  {path}")
 
     elif verb == "READ":
-        full = safe_join(root, statement.target_path())
+        full = paths["target"]
         if not os.path.isfile(full):
-            print(f"  File {statement.target_path()} not found.")
+            print(f"  File {args[0]} not found.")
             return
         with open(full) as f:
             print(f.read().rstrip())
 
     elif verb == "SHARE":
         # No adapters yet: sharing is recorded, nothing is actually sent.
-        person = " ".join(args[args.index("WITH") + 1:]) \
-            if "WITH" in [w.upper() for w in args] else "someone"
-        print(f"  Shared {statement.target_path()} with {person} "
+        idx = find_keyword(args, "WITH")
+        person = " ".join(args[idx + 1:]) if idx >= 0 else "someone"
+        print(f"  Shared {args[0]} with {person} "
               f"(recorded — no adapter yet, nothing was sent).")
 
     elif verb == "COPY":
-        src = safe_join(root, args[0])
-        dest_folder = safe_join(root, args[args.index("TO") + 1])
+        src = paths["target"]
+        dest_folder = paths["dest"]
         if not os.path.isfile(src):
             print(f"  File {args[0]} not found.")
             return
         os.makedirs(dest_folder, exist_ok=True)
         shutil.copy2(src, os.path.join(dest_folder,
                                        os.path.basename(src)))
-        print(f"  Copied {args[0]} to {args[args.index('TO') + 1]}.")
+        print(f"  Copied {args[0]} to "
+              f"{args[find_keyword(args, 'TO') + 1]}.")
 
     elif verb == "MOVE":
-        src = safe_join(root, args[0])
-        dest_folder = safe_join(root, args[args.index("TO") + 1])
+        src = paths["target"]
+        dest_folder = paths["dest"]
         if not os.path.isfile(src):
             print(f"  File {args[0]} not found.")
             return
         os.makedirs(dest_folder, exist_ok=True)
         shutil.move(src, os.path.join(dest_folder,
                                       os.path.basename(src)))
-        print(f"  Moved {args[0]} to {args[args.index('TO') + 1]}.")
+        print(f"  Moved {args[0]} to "
+              f"{args[find_keyword(args, 'TO') + 1]}.")
 
     elif verb == "DELETE":
-        full = safe_join(root, statement.target_path())
+        full = paths["target"]
         if not os.path.isfile(full):
-            print(f"  File {statement.target_path()} not found.")
+            print(f"  File {args[0]} not found.")
             return
         os.remove(full)
-        print(f"  Deleted {statement.target_path()}.")
+        print(f"  Deleted {args[0]}.")
 
     elif verb == "RENAME":
-        src = safe_join(root, args[0])
-        new_name = args[args.index("TO") + 1]
+        src = paths["target"]
+        new_name = args[find_keyword(args, "TO") + 1]
         if not os.path.isfile(src):
             print(f"  File {args[0]} not found.")
             return
-        os.rename(src, os.path.join(os.path.dirname(src), new_name))
+        os.rename(src, paths["dest"])
         print(f"  Renamed {args[0]} to {new_name}.")
+
+
+def run_one(statement, rules, root, log, execute, auto_approve,
+            approver):
+    """Run one statement: validate, resolve, decide, log, then act.
+
+    The audit line is written BEFORE the action, so a crash still
+    leaves the record. Returns the decision as logged.
+    """
+    dry_run = not execute
+    print(statement.raw)
+    verb = statement.verb
+
+    # A bare REQUIRE approval line is a checkpoint, not an action.
+    if verb == "REQUIRE":
+        decision, reason, who = decide_checkpoint(
+            statement, auto_approve, approver, dry_run)
+    else:
+        error = validate(statement)
+        if error is not None:
+            decision, reason, who = "denied", \
+                f"incomplete: {error}", None
+            paths = None
+        else:
+            paths, error = resolve_statement(statement, root)
+            if error is not None:
+                decision, reason, who = "denied", error, None
+            else:
+                pairs = check_pairs(statement, paths, root)
+                decision, reason, who = decide(
+                    rules, pairs, statement, auto_approve, approver,
+                    dry_run)
+                if decision in ("allowed", "approved-by-human",
+                                "auto-approved") \
+                        and verb in NEEDS_MODEL:
+                    # The model is not here. Say so, do not fake it.
+                    decision = "needs-model"
+                    reason = "needs a language model behind it"
+
+    logged = decision if execute else f"dry-run:{decision}"
+
+    # The record goes down before anything happens.
+    stamp = datetime.now().isoformat(timespec="seconds")
+    log.write(f"{stamp} | {statement.raw} | {logged} | "
+              f"{who or '-'}\n")
+    log.flush()
+    print(f"  {logged.upper()} — {reason}")
+
+    if decision in ("allowed", "approved-by-human", "auto-approved") \
+            and verb != "REQUIRE":
+        # A checkpoint has no action; everything else runs below.
+        if verb in NEEDS_MODEL:
+            print("  Needs a language model behind it — "
+                  "this toy has none, so nothing was done.")
+        elif dry_run and verb in MUTATING:
+            print(f"  Dry run — would {would_do(statement)}; "
+                  f"nothing was changed.")
+            print("  (Add --execute to actually do it.)")
+        else:
+            try:
+                run_statement(statement, root, paths)
+            except OSError as error:
+                # The record is already written. Say what failed
+                # and carry on with the next statement.
+                print(f"  Failed: {error}")
+    elif dry_run and decision == "needs-approval" \
+            and verb in MUTATING:
+        # A dry run never asks, but it still says what would happen.
+        print(f"  Dry run — would {would_do(statement)} once a "
+              f"human approves it; nothing was changed.")
+
+    return logged
+
+
+def default_approver():
+    """Who is approving, when nobody says: the login name."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "reader"
 
 
 def main():
@@ -340,48 +620,44 @@ def main():
     parser.add_argument("--auto-approve", action="store_true",
                         help="approve every REQUIRE prompt automatically "
                              "(demo runs only)")
+    parser.add_argument("--approver", default=None,
+                        help="name recorded on approvals "
+                             "(default: the login name)")
+    parser.add_argument("--execute", action="store_true",
+                        help="actually perform the allowed actions; "
+                             "without it the run is dry and changes "
+                             "nothing")
     args = parser.parse_args()
 
-    if not os.path.isdir(args.root):
+    root = os.path.realpath(args.root)
+    if not os.path.isdir(root):
         die(f"no such folder: {args.root}")
+    try:
+        rules = parse_policy(args.policy)
+    except OSError as error:
+        die(f"cannot read policy file: {error}")
+    try:
+        statements = parse_script(args.script)
+    except OSError as error:
+        die(f"cannot read script file: {error}")
 
-    rules = parse_policy(args.policy)
-    statements = parse_script(args.script)
+    approver = args.approver or default_approver()
 
     print(f"Policy: {args.policy} ({len(rules)} rules)")
     print(f"Script: {args.script} ({len(statements)} statements)")
     print(f"Folder: {args.root}")
+    if args.execute:
+        print("Mode: EXECUTE — allowed actions will actually happen.")
+    else:
+        print("Mode: DRY RUN — nothing will change. "
+              "Add --execute to actually do it.")
+    print(f"Approver: {approver}")
     print()
 
     with open(args.audit, "a") as log:
         for statement in statements:
-            print(statement.raw)
-
-            # A bare REQUIRE approval line is a checkpoint, not an action.
-            if statement.verb == "REQUIRE":
-                if ask_human(statement, args.auto_approve):
-                    decision, reason = "approved-by-human", \
-                        "human approved the checkpoint"
-                else:
-                    decision, reason = "denied", "human said no"
-                print(f"  {decision.upper()} — {reason}")
-            else:
-                decision, reason = decide(rules, statement,
-                                           args.auto_approve)
-                print(f"  {decision.upper()} — {reason}")
-                if decision in ("allowed", "approved-by-human"):
-                    if statement.verb in NEEDS_MODEL:
-                        # The model is not here. Say so, do not fake it.
-                        decision = "needs-model"
-                        print("  Needs a language model behind it — "
-                              "this toy has none, so nothing was done.")
-                    else:
-                        run_statement(statement, args.root)
-
-            # One append-only line per statement, whatever happened.
-            stamp = datetime.now().isoformat(timespec="seconds")
-            log.write(f"{stamp} | {statement.raw} | {decision}\n")
-            log.flush()
+            run_one(statement, rules, root, log, args.execute,
+                    args.auto_approve, approver)
             print()
 
     print(f"Audit trail: {args.audit}")
