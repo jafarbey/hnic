@@ -11,6 +11,7 @@ folder, and a shared/ folder, then runs statements through the same
 run_one() the real runtime uses, with the output captured.
 """
 import io
+import json
 import os
 import subprocess
 import sys
@@ -56,6 +57,14 @@ class ToyTestCase(unittest.TestCase):
         write(path, text)
         return hnic.parse_policy(path)
 
+    def log_records(self):
+        """The audit lines so far, each parsed as one JSON object.
+        A line that is not valid JSON fails the test right here —
+        the audit trail is one JSON object per line, always."""
+        lines = [line for line in self.log.getvalue().splitlines()
+                 if line.strip()]
+        return [json.loads(line) for line in lines]
+
     def run_line(self, line, rules, execute=True, auto_approve=False,
             approver="tester"):
         """Run one statement, capturing the printed output. The line
@@ -82,7 +91,7 @@ class ToyTestCase(unittest.TestCase):
             "READ /clients/../finance/salaries.csv", rules)
         self.assertEqual(decision, "denied")
         self.assertNotIn("secret salary", out)
-        self.assertIn("denied", self.log.getvalue())
+        self.assertEqual(self.log_records()[-1]["decision"], "denied")
 
         # The same trick on a SEARCH folder is denied too.
         decision, _ = self.run_line(
@@ -133,52 +142,60 @@ class ToyTestCase(unittest.TestCase):
 
     def test_auto_approve_logs_auto_and_survives_failure(self):
         # Problem 4: --auto-approve records "auto-approved", never
-        # "approved-by-human", and the approver column says "auto" —
+        # "approved-by-human", and the approver field says "auto" —
         # no person's name is attached to an approval nobody gave.
+        # The approver here is "Grace", not "Ada": the statement
+        # shares WITH Ada Lovelace, and an approver named Ada would
+        # make the "no name in the log" check meaningless.
         rules = self.rules("REQUIRE approval BEFORE SHARE\n"
                            "ALLOW SHARE IN /clients\n")
         decision, _ = self.run_line(
             "SHARE /clients/contract.txt WITH Ada Lovelace",
-            rules, auto_approve=True, approver="Ada")
+            rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
-        log = self.log.getvalue()
-        self.assertIn("auto-approved", log)
-        self.assertNotIn("approved-by-human", log)
-        self.assertIn("| auto", log)
-        self.assertNotIn("Ada", log)
+        records = self.log_records()
+        self.assertEqual(records[-1]["decision"], "auto-approved")
+        self.assertEqual(records[-1]["approver"], "auto")
+        self.assertNotIn("Grace", self.log.getvalue())
 
         # The log line is written BEFORE the action: even when the
         # action then fails, the record is already there.
         rules = self.rules("ALLOW COPY IN /clients\n"
                            "ALLOW COPY IN /shared\n")
-        before = self.log.tell()
+        before = len(self.log_records())
         with mock.patch("shutil.copy2",
                         side_effect=OSError("disk full")):
             decision, out = self.run_line(
                 "COPY /clients/contract.txt TO /shared", rules)
         self.assertEqual(decision, "allowed")
         self.assertIn("Failed: disk full", out)
-        logged = self.log.getvalue()[before:]
-        self.assertIn(
-            "/clients/contract.txt -> /shared/contract.txt", logged)
-        self.assertIn("allowed", logged)
+        records = self.log_records()[before:]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["path"],
+                         "/clients/contract.txt")
+        self.assertEqual(records[0]["destination"],
+                         "/shared/contract.txt")
+        self.assertEqual(records[0]["decision"], "allowed")
         self.assertFalse(os.path.exists(
             os.path.join(self.root, "shared", "contract.txt")))
 
     def test_interactive_approval_records_approver(self):
         # A human who says yes is recorded by name; a no is a denial.
+        # The approver is "Grace", not "Ada": the statement shares
+        # WITH Ada Lovelace, so a name check against "Ada" would
+        # pass on the recipient alone.
         rules = self.rules("REQUIRE approval BEFORE SHARE\n"
                            "ALLOW SHARE IN /clients\n")
         with mock.patch("builtins.input", return_value="y"):
             decision, _ = self.run_line(
                 "SHARE /clients/contract.txt WITH Ada Lovelace",
-                rules, approver="Ada")
+                rules, approver="Grace")
         self.assertEqual(decision, "approved-by-human")
-        self.assertIn("Ada", self.log.getvalue())
+        self.assertEqual(self.log_records()[-1]["approver"], "Grace")
         with mock.patch("builtins.input", return_value="n"):
             decision, _ = self.run_line(
                 "SHARE /clients/contract.txt WITH Ada Lovelace",
-                rules, approver="Ada")
+                rules, approver="Grace")
         self.assertEqual(decision, "denied")
 
     def test_lowercase_keywords_and_missing_args(self):
@@ -190,7 +207,7 @@ class ToyTestCase(unittest.TestCase):
                            "ALLOW COPY IN /shared\n")
         decision, _ = self.run_line(
             "SHARE /clients/contract.txt with Ada Lovelace",
-            rules, auto_approve=True, approver="Ada")
+            rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
         decision, _ = self.run_line(
             "COPY /clients/contract.txt to /shared", rules)
@@ -217,7 +234,8 @@ class ToyTestCase(unittest.TestCase):
         self.assertEqual(decision, "dry-run:allowed")
         self.assertFalse(os.path.exists(
             os.path.join(self.root, "shared", "contract.txt")))
-        self.assertIn("dry-run", self.log.getvalue())
+        self.assertEqual(self.log_records()[-1]["decision"],
+                         "dry-run:allowed")
         decision, _ = self.run_line(
             "DELETE /clients/contact.txt", rules, execute=False)
         self.assertEqual(decision, "dry-run:allowed")
@@ -300,49 +318,52 @@ class ToyTestCase(unittest.TestCase):
 
     def test_audit_logs_resolved_path(self):
         # The audit line records the file actually touched, not the
-        # path as written.
+        # path as written. The statement field still carries the line
+        # as written — it is the path field that must be resolved.
         rules = self.rules("ALLOW READ IN /clients\n"
                            "DENY READ IN /finance\n")
         decision, _ = self.run_line(
             "READ /clients/../finance/salaries.csv", rules)
         self.assertEqual(decision, "denied")
-        log = self.log.getvalue()
-        self.assertIn("/finance/salaries.csv", log)
-        self.assertNotIn("/clients/../finance", log)
+        record = self.log_records()[-1]
+        self.assertEqual(record["path"], "/finance/salaries.csv")
+        self.assertEqual(record["statement"],
+                         "READ /clients/../finance/salaries.csv")
 
         # A COPY with ".." in the source logs the resolved source
-        # and destination, joined with an arrow.
+        # and destination as separate fields.
         rules = self.rules("ALLOW COPY IN /clients\n"
                            "ALLOW COPY IN /shared\n")
         decision, _ = self.run_line(
             "COPY /clients/../clients/contract.txt TO /shared", rules)
         self.assertEqual(decision, "allowed")
-        log = self.log.getvalue()
-        self.assertIn(
-            "/clients/contract.txt -> /shared/contract.txt", log)
-        self.assertNotIn("/clients/../clients", log)
+        record = self.log_records()[-1]
+        self.assertEqual(record["path"], "/clients/contract.txt")
+        self.assertEqual(record["destination"],
+                         "/shared/contract.txt")
 
     def test_auto_approve_records_auto(self):
-        # An auto-approval records "auto" in the approver column —
+        # An auto-approval records "auto" in the approver field —
         # never a person's name, because no human approved anything.
-        # A human approval still records the name.
+        # A human approval still records the name. The approver is
+        # "Grace", not "Ada": the statement shares WITH Ada
+        # Lovelace, so "Ada" in the log would prove nothing.
         rules = self.rules("REQUIRE approval BEFORE SHARE\n"
                            "ALLOW SHARE IN /clients\n")
         decision, _ = self.run_line(
             "SHARE /clients/contract.txt WITH Ada Lovelace",
-            rules, auto_approve=True, approver="Ada")
+            rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
-        log = self.log.getvalue()
-        self.assertIn("auto-approved", log)
-        self.assertNotIn("approved-by-human", log)
-        self.assertIn("| auto", log)
-        self.assertNotIn("Ada", log)
+        record = self.log_records()[-1]
+        self.assertEqual(record["decision"], "auto-approved")
+        self.assertEqual(record["approver"], "auto")
+        self.assertNotIn("Grace", self.log.getvalue())
         with mock.patch("builtins.input", return_value="y"):
             decision, _ = self.run_line(
                 "SHARE /clients/contract.txt WITH Ada Lovelace",
-                rules, approver="Ada")
+                rules, approver="Grace")
         self.assertEqual(decision, "approved-by-human")
-        self.assertIn("| Ada", self.log.getvalue())
+        self.assertEqual(self.log_records()[-1]["approver"], "Grace")
 
     def test_approval_still_needs_allow(self):
         # An approval satisfies the REQUIRE rule, not the ALLOW
@@ -351,7 +372,7 @@ class ToyTestCase(unittest.TestCase):
         rules = self.rules("REQUIRE approval BEFORE SHARE\n")
         decision, out = self.run_line(
             "SHARE /clients/contract.txt WITH Ada Lovelace",
-            rules, auto_approve=True, approver="Ada")
+            rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "denied")
         self.assertIn("no rule allows it", out)
         # With an ALLOW SHARE rule, the same approval goes through.
@@ -359,7 +380,7 @@ class ToyTestCase(unittest.TestCase):
                            "ALLOW SHARE IN /clients\n")
         decision, _ = self.run_line(
             "SHARE /clients/contract.txt WITH Ada Lovelace",
-            rules, auto_approve=True, approver="Ada")
+            rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
 
     def test_case_insensitive_deny_matching(self):
@@ -419,6 +440,63 @@ class ToyTestCase(unittest.TestCase):
             self.assertEqual(result.returncode, 2, policy_text)
             self.assertIn("hnic:", result.stderr, policy_text)
             self.assertNotIn("Traceback", result.stderr, policy_text)
+
+
+    def test_audit_line_names_the_verb_and_recipient(self):
+        # Gap 1: the audit line names the verb and, for SHARE, the
+        # recipient — a READ and a SHARE no longer look the same in
+        # the log.
+        rules = self.rules("ALLOW READ IN /clients\n"
+                           "REQUIRE approval BEFORE SHARE\n"
+                           "ALLOW SHARE IN /clients\n")
+        decision, _ = self.run_line(
+            "SHARE /clients/contract.txt WITH Ada Lovelace",
+            rules, auto_approve=True, approver="Grace")
+        self.assertEqual(decision, "auto-approved")
+        share = self.log_records()[-1]
+        self.assertEqual(share["verb"], "SHARE")
+        self.assertEqual(share["path"], "/clients/contract.txt")
+        self.assertEqual(share["recipient"], "Ada Lovelace")
+        self.assertEqual(share["decision"], "auto-approved")
+        self.assertEqual(share["approver"], "auto")
+
+        decision, _ = self.run_line(
+            "READ /clients/contract.txt", rules)
+        self.assertEqual(decision, "allowed")
+        read = self.log_records()[-1]
+        self.assertEqual(read["verb"], "READ")
+        self.assertEqual(read["path"], "/clients/contract.txt")
+        self.assertNotIn("recipient", read)
+
+        # The two lines are distinguishable by verb alone.
+        self.assertNotEqual(share["verb"], read["verb"])
+
+    def test_audit_line_cannot_be_forged_with_pipes(self):
+        # Gap 2: a path holding " | " and quotes is just string
+        # content in the JSON line — it cannot inject fake columns.
+        name = 'weird "name" | auto-approved | auto.txt'
+        write(os.path.join(self.root, "clients", name), "weird\n")
+        rules = self.rules("ALLOW READ IN /clients\n")
+        line = ('READ "/clients/weird \\"name\\" | auto-approved | '
+                'auto.txt"')
+        decision, out = self.run_line(line, rules)
+        self.assertEqual(decision, "allowed")
+        self.assertIn("weird", out)
+        lines = [line for line in self.log.getvalue().splitlines()
+                 if line.strip()]
+        # Exactly one audit line for this statement, and it parses
+        # as exactly one JSON object.
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["verb"], "READ")
+        self.assertEqual(record["path"], "/clients/" + name)
+        self.assertEqual(record["decision"], "allowed")
+        self.assertEqual(record["approver"], "-")
+        # No extra fields: the forged text added nothing.
+        self.assertEqual(set(record),
+                         {"timestamp", "statement", "verb", "path",
+                          "decision", "approver"})
+        self.assertEqual(record["statement"], line)
 
 
 if __name__ == "__main__":
