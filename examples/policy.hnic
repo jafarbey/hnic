@@ -1,6 +1,7 @@
 # HNIC policy: who may do what, in plain words.
 ALLOW SEARCH files IN /clients
 REQUIRE approval BEFORE SHARE
+ALLOW SHARE IN /clients
 DENY DELETE
 DENY COPY
 DENY READ IN /finance
