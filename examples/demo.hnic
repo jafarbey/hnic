@@ -1,0 +1,8 @@
+# The ten-minute flow: search one folder, share one file with
+# approval, a blocked copy, a blocked delete — plus one blocked
+# read, to show the folder-scoped DENY rule working.
+SEARCH files IN /clients
+SHARE /clients/contract-acme.txt WITH Ada Lovelace
+READ /finance/salaries.csv
+COPY /clients/contract-acme.txt TO /shared
+DELETE /clients/acme-contact.txt
