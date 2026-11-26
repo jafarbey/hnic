@@ -63,12 +63,16 @@ COPY and MOVE are checked twice: once for the folder the file comes
 from, once for the folder it goes to. RENAME is checked for the folder
 the file sits in and the folder the new name lands in.
 
-The audit trail is written BEFORE the action runs, so a crash still
-leaves the record. The audit line records the resolved path actually
-touched, not the path as written. An approval is recorded with the
-name of the person who approved it (--approver, or the login name
-when not given); --auto-approve records "auto" in the approver
-column, because no human approved anything.
+The audit trail is one JSON object per line, written BEFORE the
+action runs, so a crash still leaves the record. Each line names the
+verb, the resolved path actually touched (and the destination for
+COPY, MOVE, and RENAME), the recipient for SHARE, the decision, and
+the approver. JSON escaping is what keeps the record honest: a path
+containing " | " or quotes is just string content, never a new
+column. An approval is recorded with the name of the person who
+approved it (--approver, or the login name when not given);
+--auto-approve records "auto" in the approver field, because no
+human approved anything.
 
 COPY, MOVE, and RENAME refuse when the destination already exists:
 overwriting is a backdoor delete, and this toy never overwrites.
@@ -81,6 +85,7 @@ model behind them and do not pretend to work.
 
 import argparse
 import getpass
+import json
 import os
 import shlex
 import shutil
@@ -390,20 +395,36 @@ def rel_display(resolved, root):
     return "/" + rel if rel != "." else "/"
 
 
-def resolved_display(statement, paths, root):
-    """What the audit line records: the resolved path(s) actually
-    touched, not the path as written. When nothing resolved — a bad
-    statement, a path that escapes the folder, a checkpoint — the
-    line as written is all there is to record."""
-    if paths is None:
-        return statement.raw
-    verb = statement.verb
-    target = rel_display(paths["target"], root)
-    if verb == "SEARCH":
-        return target
-    if verb in ("COPY", "MOVE", "RENAME"):
-        return f"{target} -> {rel_display(destination_file(statement, paths), root)}"
-    return target
+def audit_record(statement, paths, root, decision, who):
+    """One audit line, as a dict to be written as JSON.
+
+    Fields: timestamp, statement (the line as written), verb, path
+    (the resolved path actually touched), destination (COPY, MOVE,
+    and RENAME only), recipient (SHARE only), decision, approver.
+    JSON escaping is what keeps the record honest: a path holding
+    " | " or quotes is string content, never a new column. When
+    nothing resolved — a bad statement, a path that escapes the
+    folder, a checkpoint — there is no path to record, and the
+    statement field is all there is.
+    """
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "statement": statement.raw,
+        "verb": statement.verb,
+        "decision": decision,
+        "approver": who or "-",
+    }
+    if paths is not None:
+        record["path"] = rel_display(paths["target"], root)
+        if statement.verb in ("COPY", "MOVE", "RENAME"):
+            dest = destination_file(statement, paths)
+            if dest is not None:
+                record["destination"] = rel_display(dest, root)
+    if statement.verb == "SHARE":
+        idx = find_keyword(statement.args, "WITH")
+        if 0 <= idx < len(statement.args) - 1:
+            record["recipient"] = " ".join(statement.args[idx + 1:])
+    return record
 
 
 def check_pairs(statement, paths, root):
@@ -676,11 +697,13 @@ def run_one(statement, rules, root, log, execute, auto_approve,
 
     logged = decision if execute else f"dry-run:{decision}"
 
-    # The record goes down before anything happens. It carries the
-    # resolved path actually touched, not the path as written.
-    stamp = datetime.now().isoformat(timespec="seconds")
-    log.write(f"{stamp} | {resolved_display(statement, paths, root)}"
-              f" | {logged} | {who or '-'}\n")
+    # The record goes down before anything happens, as one JSON
+    # object per line. It names the verb, the resolved path actually
+    # touched, the recipient for SHARE, the decision, and who
+    # approved it — a path holding " | " or quotes cannot forge a
+    # column, because JSON escaping keeps it string content.
+    log.write(json.dumps(audit_record(statement, paths, root,
+                                     logged, who)) + "\n")
     log.flush()
     print(f"  {logged.upper()} — {reason}")
 
