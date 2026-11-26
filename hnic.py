@@ -54,7 +54,9 @@ Script lines (one statement per line, plain words):
 Decision order for every statement:
     1. A matching DENY rule refuses it.
     2. A matching REQUIRE rule stops and asks a human.
-    3. A matching ALLOW rule lets it run.
+    3. An approval satisfies the REQUIRE rule, not the ALLOW
+       rule: every folder the statement touches must still match
+       an ALLOW, or the statement is denied.
     4. No matching rule refuses it. Silence is not permission.
 
 COPY and MOVE are checked twice: once for the folder the file comes
@@ -62,10 +64,16 @@ from, once for the folder it goes to. RENAME is checked for the folder
 the file sits in and the folder the new name lands in.
 
 The audit trail is written BEFORE the action runs, so a crash still
-leaves the record. An approval is recorded with the name of the person
-who approved it (--approver, or the login name when not given).
---auto-approve records "auto-approved", never "approved-by-human",
-because no human approved anything.
+leaves the record. The audit line records the resolved path actually
+touched, not the path as written. An approval is recorded with the
+name of the person who approved it (--approver, or the login name
+when not given); --auto-approve records "auto" in the approver
+column, because no human approved anything.
+
+COPY, MOVE, and RENAME refuse when the destination already exists:
+overwriting is a backdoor delete, and this toy never overwrites.
+Policy matching ignores case, so a rule written for /finance also
+catches /FINANCE. Paths may be quoted when they contain spaces.
 
 SUMMARIZE and EXTRACT are stubs: they print that they need a language
 model behind them and do not pretend to work.
@@ -74,6 +82,7 @@ model behind them and do not pretend to work.
 import argparse
 import getpass
 import os
+import shlex
 import shutil
 import sys
 from datetime import datetime
@@ -98,9 +107,13 @@ def clean_path(text):
 
 
 def inside(child, parent):
-    """True when folder `child` is `parent` itself or under it."""
-    parent = parent.rstrip("/") or "/"
-    child = child.rstrip("/") or "/"
+    """True when folder `child` is `parent` itself or under it.
+
+    Matching ignores case, so a rule written for /finance also
+    catches /FINANCE on a case-insensitive filesystem. The action
+    itself still uses the real resolved path from the disk."""
+    parent = (parent.rstrip("/") or "/").lower()
+    child = (child.rstrip("/") or "/").lower()
     if parent == "/":
         return True
     return child == parent or child.startswith(parent + "/")
@@ -129,23 +142,43 @@ class Rule:
 
 
 def parse_policy(path):
-    """Read a policy file into a list of Rules."""
+    """Read a policy file into a list of Rules.
+
+    A malformed line fails closed with a clear one-line error, never
+    a traceback: the policy is the safety core, so a half-read
+    policy must not run. Paths may be quoted when they contain
+    spaces; unquoted lines work exactly as before.
+    """
     rules = []
     with open(path) as f:
         for number, raw in enumerate(f, 1):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            words = line.split()
+            try:
+                words = shlex.split(line)
+            except ValueError:
+                die(f"{path}:{number}: unbalanced quote")
+            if not words:
+                die(f"{path}:{number}: empty rule")
             head = words[0].upper()
             if head == "ALLOW" or head == "DENY":
                 # ALLOW SEARCH files IN /clients  |  DENY DELETE
+                if len(words) < 2:
+                    die(f"{path}:{number}: expected "
+                        f"'{head} <verb> [IN <folder>]'")
                 verb = words[1].upper()
                 folder = None
                 if len(words) > 2 and words[2].upper() == "IN":
+                    if len(words) < 4:
+                        die(f"{path}:{number}: expected "
+                            f"'{head} {verb} IN <folder>'")
                     folder = "/" + clean_path(words[3])
                 elif len(words) > 2 and words[2].upper() == "FILES":
                     if len(words) > 3 and words[3].upper() == "IN":
+                        if len(words) < 5:
+                            die(f"{path}:{number}: expected "
+                                f"'{head} {verb} files IN <folder>'")
                         folder = "/" + clean_path(words[4])
                 if verb not in VERBS:
                     die(f"{path}:{number}: unknown verb {verb!r}")
@@ -159,6 +192,10 @@ def parse_policy(path):
                 verb = words[3].upper()
                 folder = None
                 if len(words) > 4 and words[4].upper() == "IN":
+                    if len(words) < 6:
+                        die(f"{path}:{number}: expected "
+                            f"'REQUIRE approval BEFORE {verb} "
+                            f"IN <folder>'")
                     folder = "/" + clean_path(words[5])
                 if verb not in VERBS:
                     die(f"{path}:{number}: unknown verb {verb!r}")
@@ -172,10 +209,11 @@ def parse_policy(path):
 class Statement:
     """One script line: a verb and the words that follow it."""
 
-    def __init__(self, raw, verb, args):
+    def __init__(self, raw, verb, args, error=None):
         self.raw = raw    # the line as written, for the audit trail
         self.verb = verb
         self.args = args  # the remaining words, split
+        self.error = error  # set when the line could not be parsed
 
     def target_folder(self):
         """The folder a SEARCH statement names, as written."""
@@ -183,6 +221,29 @@ class Statement:
             idx = [w.upper() for w in self.args].index("IN")
             return "/" + clean_path(self.args[idx + 1])
         return "/"
+
+
+def parse_line(line):
+    """Parse one script line into a Statement, or None for a blank
+    or comment line. Paths may be quoted: READ "/clients/my file.txt"
+    works, and unquoted lines work exactly as before. A line with an
+    unbalanced quote becomes a Statement carrying an error — it is
+    denied when run, never a crash."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    try:
+        words = shlex.split(stripped)
+    except ValueError:
+        return Statement(stripped, "", [], error="unbalanced quote")
+    if not words:
+        return None
+    verb = words[0].upper()
+    if verb == "REQUIRE":
+        # A bare "REQUIRE approval" line is a checkpoint:
+        # stop and ask a human before going on.
+        return Statement(stripped, "REQUIRE", [])
+    return Statement(stripped, verb, words[1:])
 
 
 def parse_script(path):
@@ -193,18 +254,10 @@ def parse_script(path):
     """
     statements = []
     with open(path) as f:
-        for number, raw in enumerate(f, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            words = line.split()
-            verb = words[0].upper()
-            if verb == "REQUIRE":
-                # A bare "REQUIRE approval" line is a checkpoint:
-                # stop and ask a human before going on.
-                statements.append(Statement(line, "REQUIRE", []))
-                continue
-            statements.append(Statement(line, verb, words[1:]))
+        for raw in f:
+            statement = parse_line(raw)
+            if statement is not None:
+                statements.append(statement)
     return statements
 
 
@@ -228,6 +281,8 @@ def find_keyword(args, word):
 def validate(statement):
     """Return an error string when the statement is incomplete or
     unknown, else None. A bad statement is denied, never a crash."""
+    if statement.error is not None:
+        return statement.error
     verb, args = statement.verb, statement.args
     if verb == "REQUIRE":
         return None
@@ -319,6 +374,38 @@ def resolve_statement(statement, root):
     return paths, None
 
 
+def destination_file(statement, paths):
+    """The full path a COPY, MOVE, or RENAME would write to, or None."""
+    if statement.verb in ("COPY", "MOVE"):
+        return os.path.join(paths["dest"],
+                            os.path.basename(paths["target"]))
+    if statement.verb == "RENAME":
+        return paths["dest"]
+    return None
+
+
+def rel_display(resolved, root):
+    """A resolved path as the audit line shows it: /clients/x.txt."""
+    rel = os.path.relpath(resolved, root)
+    return "/" + rel if rel != "." else "/"
+
+
+def resolved_display(statement, paths, root):
+    """What the audit line records: the resolved path(s) actually
+    touched, not the path as written. When nothing resolved — a bad
+    statement, a path that escapes the folder, a checkpoint — the
+    line as written is all there is to record."""
+    if paths is None:
+        return statement.raw
+    verb = statement.verb
+    target = rel_display(paths["target"], root)
+    if verb == "SEARCH":
+        return target
+    if verb in ("COPY", "MOVE", "RENAME"):
+        return f"{target} -> {rel_display(destination_file(statement, paths), root)}"
+    return target
+
+
 def check_pairs(statement, paths, root):
     """The (verb, folder) pairs this statement must pass.
 
@@ -338,6 +425,14 @@ def check_pairs(statement, paths, root):
         elif verb == "RENAME":
             pairs.append((verb, policy_folder(root, paths["dest"])))
     return pairs
+
+
+def pair_has_allow(rules, verb, folder):
+    """True when some ALLOW rule matches this (verb, folder)."""
+    for rule in rules:
+        if rule.kind == "ALLOW" and rule.matches(verb, folder):
+            return True
+    return False
 
 
 def check_pair(rules, verb, folder):
@@ -378,7 +473,12 @@ def decide(rules, pairs, statement, auto_approve, approver, dry_run):
     Returns (decision, reason, approver): decision is "allowed",
     "denied", "approved-by-human", "auto-approved", or, in a dry
     run, "needs-approval" when a human would have been asked.
-    Approver is the name recorded on an approval, else None.
+    Approver is "auto" for an auto-approval, the approver's name
+    for a human approval, else None.
+
+    An approval satisfies the REQUIRE rule, not the ALLOW rule:
+    after a human approves, every pair must still match an ALLOW,
+    or the statement is denied.
     """
     outcomes = [check_pair(rules, verb, folder)
                 for verb, folder in pairs]
@@ -392,25 +492,29 @@ def decide(rules, pairs, statement, auto_approve, approver, dry_run):
     #    run nothing will happen, so nobody is asked.
     required = [reason for outcome, reason in outcomes
                 if outcome == "require"]
+    approved = False
     if required:
         if dry_run:
             return "needs-approval", \
                 f"would stop and ask a human ({required[0]})", None
         if ask_human(statement, auto_approve):
-            if auto_approve:
-                return "auto-approved", \
-                    f"auto-approved for the demo ({required[0]})", \
-                    approver
-            return "approved-by-human", \
-                f"human approved ({required[0]})", approver
-        return "denied", "human said no", None
+            approved = True
+        else:
+            return "denied", "human said no", None
 
     # 3. Silence is not permission: every pair needs an ALLOW.
-    for outcome, reason in outcomes:
-        if outcome == "none":
-            return "denied", reason, None
+    for verb, folder in pairs:
+        if not pair_has_allow(rules, verb, folder):
+            return "denied", "no rule allows it", None
 
-    # 4. Every pair is allowed.
+    # 4. Every pair is allowed — and approved, when approval was
+    #    required.
+    if approved:
+        if auto_approve:
+            return "auto-approved", \
+                f"auto-approved for the demo ({required[0]})", "auto"
+        return "approved-by-human", \
+            f"human approved ({required[0]})", approver
     return "allowed", outcomes[0][1], None
 
 
@@ -421,7 +525,7 @@ def decide_checkpoint(statement, auto_approve, approver, dry_run):
     if ask_human(statement, auto_approve):
         if auto_approve:
             return "auto-approved", "auto-approved for the demo", \
-                approver
+                "auto"
         return "approved-by-human", "human approved the checkpoint", \
             approver
     return "denied", "human said no", None
@@ -432,18 +536,19 @@ def would_do(statement):
     verb, args = statement.verb, statement.args
     if verb == "SHARE":
         idx = find_keyword(args, "WITH")
-        person = " ".join(args[idx + 1:]) if idx >= 0 else "someone"
+        person = " ".join(args[idx + 1:]) \
+            if 0 <= idx < len(args) - 1 else "someone"
         return f"share {args[0]} with {person}"
     if verb in ("COPY", "MOVE"):
         idx = find_keyword(args, "TO")
-        dest = args[idx + 1] if idx >= 0 else "?"
+        dest = args[idx + 1] if 0 <= idx < len(args) - 1 else "?"
         action = "copy" if verb == "COPY" else "move"
         return f"{action} {args[0]} to {dest}"
     if verb == "DELETE":
         return f"delete {args[0]}"
     if verb == "RENAME":
         idx = find_keyword(args, "TO")
-        new = args[idx + 1] if idx >= 0 else "?"
+        new = args[idx + 1] if 0 <= idx < len(args) - 1 else "?"
         return f"rename {args[0]} to {new}"
     return statement.raw.lower()
 
@@ -535,6 +640,7 @@ def run_one(statement, rules, root, log, execute, auto_approve,
     dry_run = not execute
     print(statement.raw)
     verb = statement.verb
+    paths = None
 
     # A bare REQUIRE approval line is a checkpoint, not an action.
     if verb == "REQUIRE":
@@ -545,11 +651,17 @@ def run_one(statement, rules, root, log, execute, auto_approve,
         if error is not None:
             decision, reason, who = "denied", \
                 f"incomplete: {error}", None
-            paths = None
         else:
             paths, error = resolve_statement(statement, root)
             if error is not None:
                 decision, reason, who = "denied", error, None
+            elif verb in ("COPY", "MOVE", "RENAME") and \
+                    os.path.lexists(destination_file(statement, paths)):
+                # Overwriting is a backdoor delete: refuse it, no
+                # exceptions, before any policy question is asked.
+                decision, reason, who = "denied", \
+                    "destination already exists — refusing " \
+                    "to overwrite", None
             else:
                 pairs = check_pairs(statement, paths, root)
                 decision, reason, who = decide(
@@ -564,10 +676,11 @@ def run_one(statement, rules, root, log, execute, auto_approve,
 
     logged = decision if execute else f"dry-run:{decision}"
 
-    # The record goes down before anything happens.
+    # The record goes down before anything happens. It carries the
+    # resolved path actually touched, not the path as written.
     stamp = datetime.now().isoformat(timespec="seconds")
-    log.write(f"{stamp} | {statement.raw} | {logged} | "
-              f"{who or '-'}\n")
+    log.write(f"{stamp} | {resolved_display(statement, paths, root)}"
+              f" | {logged} | {who or '-'}\n")
     log.flush()
     print(f"  {logged.upper()} — {reason}")
 
