@@ -58,18 +58,26 @@ What worked, what was refused:
 
 ## The audit trail
 
-`audit.log` after the demo run, one line per statement. The line is
-written before the action runs, and it records the resolved path
-actually touched — not the path as written — plus the approver
-(`auto` when `--auto-approve` answered, a name when a human did):
+`audit.log` after the demo run, one JSON object per line. The line is
+written before the action runs, and it names the verb, the resolved
+path actually touched (and the destination for COPY, MOVE, and
+RENAME), the recipient for SHARE, the decision, and the approver
+(`auto` when `--auto-approve` answered, a name when a human did).
+Because each line is JSON, a path holding ` | ` or quotes is just
+string content — it cannot forge a new column:
 
 ```
-2026-11-26T21:03:23 | /clients | allowed | -
-2026-11-26T21:03:23 | /clients/contract-acme.txt | auto-approved | auto
-2026-11-26T21:03:23 | /finance/salaries.csv | denied | -
-2026-11-26T21:03:23 | /clients/contract-acme.txt -> /shared/contract-acme.txt | denied | -
-2026-11-26T21:03:23 | /clients/acme-contact.txt | denied | -
+{"timestamp": "2026-11-26T21:32:21", "statement": "SEARCH files IN /clients", "verb": "SEARCH", "decision": "allowed", "approver": "-", "path": "/clients"}
+{"timestamp": "2026-11-26T21:32:21", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "auto-approved", "approver": "auto", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-26T21:32:21", "statement": "READ /finance/salaries.csv", "verb": "READ", "decision": "denied", "approver": "-", "path": "/finance/salaries.csv"}
+{"timestamp": "2026-11-26T21:32:21", "statement": "COPY /clients/contract-acme.txt TO /shared", "verb": "COPY", "decision": "denied", "approver": "-", "path": "/clients/contract-acme.txt", "destination": "/shared/contract-acme.txt"}
+{"timestamp": "2026-11-26T21:32:21", "statement": "DELETE /clients/acme-contact.txt", "verb": "DELETE", "decision": "denied", "approver": "-", "path": "/clients/acme-contact.txt"}
 ```
+
+A READ and a SHARE no longer look the same in the log: the SHARE
+line carries `"verb": "SHARE"` and `"recipient": "Ada Lovelace"`,
+while the READ line carries `"verb": "READ"` and no recipient field
+at all.
 
 ## The dry run
 
@@ -108,7 +116,7 @@ These were run the same day against temporary policies and a scratch
 copy of the test folder, so the demo folder stayed untouched. The
 tests in `test_hnic.py` cover the same ground and all pass
 (`python3 test_hnic.py` and `python3 -m unittest test_hnic -v` —
-15 tests).
+17 tests).
 
 **A — the approval prompt really asks.** Same demo, no
 `--auto-approve`, with `y` piped into the prompt: the SHARE was
@@ -122,11 +130,12 @@ SHARE /clients/contract-acme.txt WITH Ada Lovelace
   Approve? [y/n]   APPROVED-BY-HUMAN — human approved (policy says REQUIRE approval BEFORE SHARE)
 ```
 
-Audit lines from the two runs:
+Audit lines from the two runs — the `y` run names the approver, the
+`n` run records the denial, and both name the verb and the recipient:
 
 ```
-2026-11-26T21:03:42 | /clients/contract-acme.txt | approved-by-human | root
-2026-11-26T21:03:42 | /clients/contract-acme.txt | denied | -
+{"timestamp": "2026-11-26T21:32:34", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "approved-by-human", "approver": "root", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-26T21:32:34", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "denied", "approver": "-", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
 ```
 
 **B — the stubs and the checkpoint.** A policy allowing SUMMARIZE,
@@ -149,7 +158,10 @@ REQUIRE approval
 
 READ /clients/contract-acme.txt
   ALLOWED — policy says ALLOW READ IN /clients
-contract
+ACME CORP — SERVICE AGREEMENT
+Acme Corp agrees to pay for consulting services at the rate set out
+in Schedule A. This agreement runs for twelve months from signing.
+Either side may end it with thirty days of written notice.
 ```
 
 **C — allowed actions really act.** A policy allowing COPY, RENAME,
@@ -217,6 +229,12 @@ the root was denied as well.
 ```
 COPY /clients/contract.txt TO /shared
   DENIED — policy says DENY COPY IN /shared
+
+MOVE /clients/contact.txt TO /shared
+  DENIED — policy says DENY MOVE IN /shared
+
+COPY /clients/contract.txt TO /../outside
+  DENIED — destination escapes the folder: '/../outside'
 ```
 
 **F — the second review's fixes, shown live.** Overwriting is
@@ -225,16 +243,16 @@ RENAME are all denied — even renaming a file to its own name — and
 the existing file is untouched.
 
 ```
-COPY /clients/a.txt TO /shared
+COPY /clients/contract-acme.txt TO /shared
   DENIED — destination already exists — refusing to overwrite
 
-MOVE /clients/a.txt TO /shared
+MOVE /clients/contract-acme.txt TO /shared
   DENIED — destination already exists — refusing to overwrite
 
-RENAME /clients/a.txt TO b.txt
+RENAME /clients/acme-contact.txt TO contract-acme.txt
   DENIED — destination already exists — refusing to overwrite
 
-RENAME /clients/a.txt TO a.txt
+RENAME /clients/acme-contact.txt TO acme-contact.txt
   DENIED — destination already exists — refusing to overwrite
 ```
 
@@ -269,7 +287,27 @@ And a malformed policy line fails closed with a clear one-line
 error, not a traceback:
 
 ```
-hnic: /tmp/regen/scratch/f6b-policy.hnic:1: expected 'ALLOW <verb> [IN <folder>]'
+hnic: /tmp/regen2/pbad.hnic:1: expected 'ALLOW <verb> [IN <folder>]'
 ```
 
 exit: 2
+
+**G — a forged path cannot forge a column.** A file named
+`x | auto-approved | auto.txt`, read with a policy allowing READ in
+`/clients`: the read works, and the audit line is one JSON object
+whose `path` field holds the whole name as string content. The
+forged ` | auto-approved | auto` adds no column and no field:
+
+```
+READ "/clients/x | auto-approved | auto.txt"
+  ALLOWED — policy says ALLOW READ IN /clients
+forged
+```
+
+```
+{"timestamp": "2026-11-26T21:32:42", "statement": "READ \"/clients/x | auto-approved | auto.txt\"", "verb": "READ", "decision": "allowed", "approver": "-", "path": "/clients/x | auto-approved | auto.txt"}
+```
+
+Parsed back, that line is one object with exactly six fields —
+`timestamp`, `statement`, `verb`, `decision`, `approver`, `path` —
+and the decision is the real one, `allowed`.
