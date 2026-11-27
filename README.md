@@ -1,7 +1,7 @@
 # HNIC Toy Runtime
 
 The first runnable piece of HNIC (Human-Negotiated Intelligence Control).
-A toy, not a product — about 800 lines of Python that prove the
+A toy, not a product — about 1,000 lines of Python that prove the
 language runs. The book about it is *The Exact Frame*, by J.B. Bey.
 
 ## The idea in one sentence
@@ -47,19 +47,33 @@ perform the allowed actions.
 - `examples/demo.hnic` — the demo script: one statement per line.
 - `test-folder/` — the folder the statements act on: a client file, a
   contract, a finance folder with a salary sheet, a tax return.
-- `audit.log` — created when you run it. One JSON object per line,
-  written *before* the action runs, so a crash still leaves the
-  record. Each line names the verb, the resolved path actually
-  touched (and the destination for COPY, MOVE, and RENAME), the
-  recipient for SHARE, the decision, and who approved it (`-` when
-  nobody did, `auto` when `--auto-approve` answered). A READ and a
-  SHARE no longer look the same in the log: the SHARE line carries
-  `"verb": "SHARE"` and `"recipient": "Ada Lovelace"`, while a READ
-  line carries `"verb": "READ"` and no recipient field. Example line:
-  `{"timestamp": "2026-11-26T21:32:21", "statement": "SHARE
+- `audit.log` — created when you run it. One JSON object per line.
+  The first line for a statement is the decision, written *before*
+  the action runs, so a crash still leaves the record of what was
+  decided. After an allowed or approved action is attempted, a
+  second line records the outcome: `done`, `recorded-not-sent` for
+  a SHARE (no adapter yet, so nothing leaves the machine), `failed:
+  <error>` when the action raised, or `not-done-no-model` for
+  SUMMARIZE and EXTRACT. Denied, dry-run, and needs-approval
+  decisions get no outcome line — nothing was attempted. Each line
+  names the verb, the resolved path actually touched (and the
+  destination for COPY, MOVE, and RENAME), the recipient for
+  SHARE, the decision, and who approved it (`-` when nobody did,
+  `auto` when `--auto-approve` answered). A READ and a SHARE no
+  longer look the same in the log: the SHARE line carries `"verb":
+  "SHARE"` and `"recipient": "Ada Lovelace"`, while a READ line
+  carries `"verb": "READ"` and no recipient field. Example lines:
+  `{"timestamp": "2026-11-27T17:12:03", "statement": "SHARE
   /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE",
   "decision": "auto-approved", "approver": "auto", "path":
+  "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}` and
+  `{"timestamp": "2026-11-27T17:12:03", "statement": "SHARE
+  /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE",
+  "outcome": "recorded-not-sent", "path":
   "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}`.
+  Read it back in plain words with `python3 hnic.py --read-log
+  audit.log` — one plain sentence per line, so a non-engineer can
+  read what happened without reading JSON.
 - `DEMO-TRANSCRIPT.md` — the recorded output of a real demo run.
 
 ## How the decision works
@@ -67,10 +81,16 @@ perform the allowed actions.
 For every statement, in this order:
 
 1. A matching DENY rule refuses it.
-2. A matching REQUIRE rule stops and asks a human.
-3. An approval satisfies the REQUIRE rule, not the ALLOW rule:
-   every folder the statement touches still needs an ALLOW.
-4. No matching rule refuses it. Silence is not permission.
+2. Every folder the statement touches must match an ALLOW rule.
+   Silence is not permission — a statement with no ALLOW rule is
+   refused here, before anyone is asked, so a human is never
+   asked to approve what the policy would refuse anyway.
+3. A matching REQUIRE rule stops and asks a human.
+4. Approved, or allowed outright, when every pair passed.
+
+An approval satisfies the REQUIRE rule, not the ALLOW rule — but
+the ALLOW check already ran, so nobody is asked to approve what
+the policy refuses anyway.
 
 COPY and MOVE are checked twice: the folder the file comes from and the
 folder it goes to. RENAME is checked for both folders too. Every path is
@@ -84,6 +104,17 @@ quoted when they contain spaces: `READ "/clients/my file.txt"`.
 COPY, MOVE, and RENAME refuse when the destination already exists.
 Overwriting is a backdoor delete, and this toy never overwrites — not
 even renaming a file to its own name.
+
+## Read the log back in plain words
+
+`python3 hnic.py --read-log audit.log` reads a JSON-lines audit log
+and prints one plain sentence per line: a decision line says what
+was decided, an outcome line says what happened after. A SHARE
+decision line becomes a sentence naming the file, the recipient,
+and who approved it; its outcome line becomes a sentence saying
+it was recorded and nothing was sent. A malformed line is skipped
+with a plain note, never a crash. The mode takes only the log path
+and changes nothing.
 
 Approvals are recorded with a name on them: `--approver NAME` names the
 approver (the login name when not given). `--auto-approve` records
