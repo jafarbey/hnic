@@ -18,6 +18,8 @@ Usage:
                     --script examples/demo.hnic \
                     --root test-folder --auto-approve --execute
 
+    python3 hnic.py --read-log audit.log
+
 By default the runtime runs DRY: it checks the policy, prints the
 decision and what it would do, and logs it as dry-run, but it changes
 nothing. Add --execute to actually perform the allowed actions. The
@@ -25,6 +27,11 @@ examples in the book run read-only unless the reader says otherwise,
 and this is how the toy keeps that promise. SEARCH and READ still run
 in a dry run, because they change nothing; COPY, MOVE, DELETE, RENAME
 and SHARE are only described, never done.
+
+--read-log takes only a log path: it reads a JSON-lines audit log
+and prints it back in plain words, one sentence per line, so a
+non-engineer can read what happened without reading JSON. It
+changes nothing.
 
 Paths are resolved ONCE, with realpath, against the real root folder,
 and that same resolved path is used for both the policy check and the
@@ -53,26 +60,37 @@ Script lines (one statement per line, plain words):
 
 Decision order for every statement:
     1. A matching DENY rule refuses it.
-    2. A matching REQUIRE rule stops and asks a human.
-    3. An approval satisfies the REQUIRE rule, not the ALLOW
-       rule: every folder the statement touches must still match
-       an ALLOW, or the statement is denied.
-    4. No matching rule refuses it. Silence is not permission.
+    2. Every folder the statement touches must match an ALLOW
+       rule. Silence is not permission — a statement with no
+       ALLOW rule is refused here, before anyone is asked, so a
+       human is never asked to approve what the policy would
+       refuse anyway.
+    3. A matching REQUIRE rule stops and asks a human.
+    4. Approved, or allowed outright, when every pair passed.
 
 COPY and MOVE are checked twice: once for the folder the file comes
 from, once for the folder it goes to. RENAME is checked for the folder
 the file sits in and the folder the new name lands in.
 
-The audit trail is one JSON object per line, written BEFORE the
-action runs, so a crash still leaves the record. Each line names the
-verb, the resolved path actually touched (and the destination for
-COPY, MOVE, and RENAME), the recipient for SHARE, the decision, and
-the approver. JSON escaping is what keeps the record honest: a path
-containing " | " or quotes is just string content, never a new
-column. An approval is recorded with the name of the person who
-approved it (--approver, or the login name when not given);
---auto-approve records "auto" in the approver field, because no
-human approved anything.
+The audit trail is one JSON object per line. The first line for a
+statement is the decision, written BEFORE the action runs, so a
+crash still leaves the record of what was decided. After an
+allowed or approved action is attempted, a second line records
+the outcome: "done", "recorded-not-sent" for a SHARE (there is
+no adapter yet, so a share is recorded and nothing leaves the
+machine), "failed: <error>" when the action raised, or
+"not-done-no-model" for SUMMARIZE and EXTRACT (the model is not
+here). Denied, dry-run, and needs-approval decisions get no
+outcome line — nothing was attempted. Each line names the verb,
+the resolved path actually touched (and the destination for
+COPY, MOVE, and RENAME), the recipient for SHARE; the decision
+line also names the decision and the approver. JSON escaping is
+what keeps the record honest: a path containing " | " or quotes
+is just string content, never a new column. An approval is
+recorded with the name of the person who approved it
+(--approver, or the login name when not given); --auto-approve
+records "auto" in the approver field, because no human approved
+anything.
 
 COPY, MOVE, and RENAME refuse when the destination already exists:
 overwriting is a backdoor delete, and this toy never overwrites.
@@ -427,6 +445,38 @@ def audit_record(statement, paths, root, decision, who):
     return record
 
 
+def outcome_record(statement, paths, root, outcome):
+    """One outcome line, as a dict to be written as JSON.
+
+    Written after an allowed or approved action is attempted, so
+    the log says what happened, not just what was decided. Fields:
+    timestamp, statement (the line as written), verb, outcome,
+    path (the resolved path actually touched), destination (COPY,
+    MOVE, and RENAME only), recipient (SHARE only). The path,
+    destination, and recipient match the decision line for the
+    same statement, so the two lines pair up. Outcome values:
+    "done", "recorded-not-sent" (SHARE — no adapter yet),
+    "failed: <error>", "not-done-no-model" (SUMMARIZE, EXTRACT).
+    """
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "statement": statement.raw,
+        "verb": statement.verb,
+        "outcome": outcome,
+    }
+    if paths is not None:
+        record["path"] = rel_display(paths["target"], root)
+        if statement.verb in ("COPY", "MOVE", "RENAME"):
+            dest = destination_file(statement, paths)
+            if dest is not None:
+                record["destination"] = rel_display(dest, root)
+    if statement.verb == "SHARE":
+        idx = find_keyword(statement.args, "WITH")
+        if 0 <= idx < len(statement.args) - 1:
+            record["recipient"] = " ".join(statement.args[idx + 1:])
+    return record
+
+
 def check_pairs(statement, paths, root):
     """The (verb, folder) pairs this statement must pass.
 
@@ -497,9 +547,10 @@ def decide(rules, pairs, statement, auto_approve, approver, dry_run):
     Approver is "auto" for an auto-approval, the approver's name
     for a human approval, else None.
 
-    An approval satisfies the REQUIRE rule, not the ALLOW rule:
-    after a human approves, every pair must still match an ALLOW,
-    or the statement is denied.
+    The ALLOW check runs before anyone is asked: an approval
+    satisfies the REQUIRE rule, not the ALLOW rule, so a statement
+    with no ALLOW rule is refused here, and no human is asked to
+    approve what the policy would refuse anyway.
     """
     outcomes = [check_pair(rules, verb, folder)
                 for verb, folder in pairs]
@@ -509,7 +560,13 @@ def decide(rules, pairs, statement, auto_approve, approver, dry_run):
         if outcome == "deny":
             return "denied", reason, None
 
-    # 2. A matching REQUIRE rule stops and asks a human. In a dry
+    # 2. Silence is not permission: every pair needs an ALLOW.
+    #    Refused here, before anyone is asked.
+    for verb, folder in pairs:
+        if not pair_has_allow(rules, verb, folder):
+            return "denied", "no rule allows it", None
+
+    # 3. A matching REQUIRE rule stops and asks a human. In a dry
     #    run nothing will happen, so nobody is asked.
     required = [reason for outcome, reason in outcomes
                 if outcome == "require"]
@@ -522,11 +579,6 @@ def decide(rules, pairs, statement, auto_approve, approver, dry_run):
             approved = True
         else:
             return "denied", "human said no", None
-
-    # 3. Silence is not permission: every pair needs an ALLOW.
-    for verb, folder in pairs:
-        if not pair_has_allow(rules, verb, folder):
-            return "denied", "no rule allows it", None
 
     # 4. Every pair is allowed — and approved, when approval was
     #    required.
@@ -697,7 +749,7 @@ def run_one(statement, rules, root, log, execute, auto_approve,
 
     logged = decision if execute else f"dry-run:{decision}"
 
-    # The record goes down before anything happens, as one JSON
+    # The decision goes down before anything happens, as one JSON
     # object per line. It names the verb, the resolved path actually
     # touched, the recipient for SHARE, the decision, and who
     # approved it — a path holding " | " or quotes cannot forge a
@@ -707,13 +759,19 @@ def run_one(statement, rules, root, log, execute, auto_approve,
     log.flush()
     print(f"  {logged.upper()} — {reason}")
 
-    if decision in ("allowed", "approved-by-human", "auto-approved") \
+    # The outcome goes down after the action is attempted, as a
+    # second JSON line, so the log says what happened, not just
+    # what was decided. Denied, dry-run, and needs-approval
+    # decisions get no outcome line — nothing was attempted.
+    outcome = None
+    if decision == "needs-model":
+        # The model is not here. Say so, do not fake it.
+        if execute:
+            outcome = "not-done-no-model"
+    elif decision in ("allowed", "approved-by-human", "auto-approved") \
             and verb != "REQUIRE":
         # A checkpoint has no action; everything else runs below.
-        if verb in NEEDS_MODEL:
-            print("  Needs a language model behind it — "
-                  "this toy has none, so nothing was done.")
-        elif dry_run and verb in MUTATING:
+        if dry_run and verb in MUTATING:
             print(f"  Dry run — would {would_do(statement)}; "
                   f"nothing was changed.")
             print("  (Add --execute to actually do it.)")
@@ -721,14 +779,24 @@ def run_one(statement, rules, root, log, execute, auto_approve,
             try:
                 run_statement(statement, root, paths)
             except OSError as error:
-                # The record is already written. Say what failed
-                # and carry on with the next statement.
+                # The decision line already said allowed. Say what
+                # failed and carry on with the next statement.
                 print(f"  Failed: {error}")
+                if execute:
+                    outcome = f"failed: {error}"
+            else:
+                if execute:
+                    outcome = ("recorded-not-sent"
+                               if verb == "SHARE" else "done")
     elif dry_run and decision == "needs-approval" \
             and verb in MUTATING:
         # A dry run never asks, but it still says what would happen.
         print(f"  Dry run — would {would_do(statement)} once a "
               f"human approves it; nothing was changed.")
+    if outcome is not None:
+        log.write(json.dumps(outcome_record(statement, paths, root,
+                                           outcome)) + "\n")
+        log.flush()
 
     return logged
 
@@ -741,15 +809,181 @@ def default_approver():
         return "reader"
 
 
+def verb_phrase(record):
+    """Plain words for what a log line is about, present tense."""
+    verb = record.get("verb", "")
+    path = record.get("path", "")
+    dest = record.get("destination", "")
+    who = record.get("recipient", "")
+    if verb == "SEARCH":
+        return f"search {path}"
+    if verb == "READ":
+        return f"read {path}"
+    if verb == "SHARE":
+        return f"share {path} with {who}" if who else f"share {path}"
+    if verb == "COPY":
+        return f"copy {path} to {dest}"
+    if verb == "MOVE":
+        return f"move {path} to {dest}"
+    if verb == "DELETE":
+        return f"delete {path}"
+    if verb == "RENAME":
+        return f"rename {path} to {dest}"
+    if verb == "SUMMARIZE":
+        return f"summarize {path}"
+    if verb == "EXTRACT":
+        return f"extract {path}"
+    if verb == "REQUIRE":
+        return "the checkpoint"
+    return record.get("statement", "").lower() or "do something"
+
+
+def verb_phrase_past(record):
+    """Plain words for what a log line is about, past tense."""
+    verb = record.get("verb", "")
+    path = record.get("path", "")
+    dest = record.get("destination", "")
+    who = record.get("recipient", "")
+    if verb == "SEARCH":
+        return f"searched {path}"
+    if verb == "READ":
+        return f"read {path}"
+    if verb == "SHARE":
+        return f"shared {path} with {who}" \
+            if who else f"shared {path}"
+    if verb == "COPY":
+        return f"copied {path} to {dest}"
+    if verb == "MOVE":
+        return f"moved {path} to {dest}"
+    if verb == "DELETE":
+        return f"deleted {path}"
+    if verb == "RENAME":
+        return f"renamed {path} to {dest}"
+    if verb == "SUMMARIZE":
+        return f"summarized {path}"
+    if verb == "EXTRACT":
+        return f"extracted {path}"
+    return record.get("statement", "").lower() or "did something"
+
+
+def read_log_line(record):
+    """One plain sentence for one audit line, or None to skip it.
+
+    A decision line says what was decided; an outcome line says
+    what happened after. Both read in plain words, so a
+    non-engineer can read the log without reading JSON.
+    """
+    if "outcome" in record:
+        outcome = record["outcome"]
+        if outcome == "done":
+            return (f"It happened: the runtime "
+                    f"{verb_phrase_past(record)}.")
+        if outcome == "recorded-not-sent":
+            return (f"Recorded, not sent: the runtime recorded "
+                    f"{verb_phrase(record)}, and nothing was sent.")
+        if outcome == "not-done-no-model":
+            return (f"Not done: the runtime needs a language model "
+                    f"to {verb_phrase(record)}, and this toy has "
+                    f"none.")
+        if outcome.startswith("failed:"):
+            error = outcome[len("failed:"):].strip()
+            return (f"It failed: the runtime tried to "
+                    f"{verb_phrase(record)} and it failed "
+                    f"({error}).")
+        return None
+    if "decision" in record:
+        decision = record["decision"]
+        who = record.get("approver", "-")
+        if record.get("verb") == "REQUIRE":
+            if decision == "approved-by-human":
+                name = who if who not in ("-", "auto") else "a human"
+                return f"{name} approved the checkpoint."
+            if decision == "auto-approved":
+                return ("Auto-approved for the demo, no human "
+                        "involved: the checkpoint.")
+            if decision == "denied":
+                return "The runtime refused the checkpoint: a human said no."
+            if decision == "needs-approval":
+                return ("The runtime would stop and ask a human at "
+                        "the checkpoint.")
+            if decision.startswith("dry-run:"):
+                return ("Dry run: the runtime would stop and ask a "
+                        "human at the checkpoint, but nothing was "
+                        "changed.")
+            return None
+        if decision == "allowed":
+            return (f"The runtime allowed this: "
+                    f"{verb_phrase(record)}.")
+        if decision == "denied":
+            return (f"The runtime refused this: "
+                    f"{verb_phrase(record)}.")
+        if decision == "approved-by-human":
+            name = who if who not in ("-", "auto") else "a human"
+            return f"{name} approved this: {verb_phrase(record)}."
+        if decision == "auto-approved":
+            return (f"Auto-approved for the demo, no human involved: "
+                    f"{verb_phrase(record)}.")
+        if decision == "needs-model":
+            return (f"Not done: the runtime needs a language model "
+                    f"to {verb_phrase(record)}, and this toy has "
+                    f"none.")
+        if decision == "needs-approval":
+            return (f"The runtime would stop and ask a human before "
+                    f"{verb_phrase(record)}.")
+        if decision.startswith("dry-run:"):
+            inner = decision[len("dry-run:"):]
+            if inner == "needs-approval":
+                return (f"Dry run: the runtime would stop and ask a "
+                        f"human before {verb_phrase(record)}.")
+            return (f"Dry run: the runtime would "
+                    f"{verb_phrase(record)}, but nothing was changed.")
+        return None
+    return None
+
+
+def read_log_file(path):
+    """Print an audit log in plain words, one sentence per line.
+
+    Malformed lines are skipped with a plain note, never a crash.
+    This mode changes nothing.
+    """
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError as error:
+        die(f"cannot read log file: {error}")
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            print(f"Skipped: line {number} is not a readable audit line.")
+            continue
+        if not isinstance(record, dict) or "verb" not in record \
+                or ("decision" not in record
+                    and "outcome" not in record):
+            print(f"Skipped: line {number} is not a readable audit line.")
+            continue
+        sentence = read_log_line(record)
+        if sentence is None:
+            print(f"Skipped: line {number} is not a readable audit line.")
+            continue
+        print(sentence)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="HNIC toy runtime: run a script of statements "
                     "against a policy, in a real folder.")
-    parser.add_argument("--policy", required=True,
+    parser.add_argument("--read-log", default=None, metavar="LOG",
+                        help="read an audit log and print it in plain "
+                             "words; takes only the log path")
+    parser.add_argument("--policy", default=None,
                         help="policy file, written in HNIC")
-    parser.add_argument("--script", required=True,
+    parser.add_argument("--script", default=None,
                         help="script file: one statement per line")
-    parser.add_argument("--root", required=True,
+    parser.add_argument("--root", default=None,
                         help="folder the statements act on")
     parser.add_argument("--audit", default="audit.log",
                         help="audit trail file (default: audit.log)")
@@ -764,6 +998,13 @@ def main():
                              "without it the run is dry and changes "
                              "nothing")
     args = parser.parse_args()
+
+    if args.read_log is not None:
+        read_log_file(args.read_log)
+        return
+    if not args.policy or not args.script or not args.root:
+        parser.error("--policy, --script, and --root are required "
+                     "unless --read-log is given")
 
     root = os.path.realpath(args.root)
     if not os.path.isdir(root):
