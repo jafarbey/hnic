@@ -1,6 +1,6 @@
 # Demo Transcript
 
-Recorded from real runs on November 26, 2026. The demo command first,
+Recorded from real runs on November 27, 2026. The demo command first,
 then the dry run, then the extra checks that prove the rest of the
 runtime.
 
@@ -58,26 +58,35 @@ What worked, what was refused:
 
 ## The audit trail
 
-`audit.log` after the demo run, one JSON object per line. The line is
-written before the action runs, and it names the verb, the resolved
-path actually touched (and the destination for COPY, MOVE, and
-RENAME), the recipient for SHARE, the decision, and the approver
-(`auto` when `--auto-approve` answered, a name when a human did).
-Because each line is JSON, a path holding ` | ` or quotes is just
-string content — it cannot forge a new column:
+`audit.log` after the demo run, one JSON object per line. The first
+line for a statement is the decision, written before the action
+runs, and it names the verb, the resolved path actually touched
+(and the destination for COPY, MOVE, and RENAME), the recipient
+for SHARE, the decision, and the approver (`auto` when
+`--auto-approve` answered, a name when a human did). After an
+allowed or approved action is attempted, a second line records the
+outcome — `done`, or `recorded-not-sent` for a SHARE — so the log
+says what happened, not just what was decided. Denied statements
+get no outcome line: nothing was attempted. Because each line is
+JSON, a path holding ` | ` or quotes is just string content — it
+cannot forge a new column:
 
 ```
-{"timestamp": "2026-11-26T21:32:21", "statement": "SEARCH files IN /clients", "verb": "SEARCH", "decision": "allowed", "approver": "-", "path": "/clients"}
-{"timestamp": "2026-11-26T21:32:21", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "auto-approved", "approver": "auto", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
-{"timestamp": "2026-11-26T21:32:21", "statement": "READ /finance/salaries.csv", "verb": "READ", "decision": "denied", "approver": "-", "path": "/finance/salaries.csv"}
-{"timestamp": "2026-11-26T21:32:21", "statement": "COPY /clients/contract-acme.txt TO /shared", "verb": "COPY", "decision": "denied", "approver": "-", "path": "/clients/contract-acme.txt", "destination": "/shared/contract-acme.txt"}
-{"timestamp": "2026-11-26T21:32:21", "statement": "DELETE /clients/acme-contact.txt", "verb": "DELETE", "decision": "denied", "approver": "-", "path": "/clients/acme-contact.txt"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "SEARCH files IN /clients", "verb": "SEARCH", "decision": "allowed", "approver": "-", "path": "/clients"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "SEARCH files IN /clients", "verb": "SEARCH", "outcome": "done", "path": "/clients"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "auto-approved", "approver": "auto", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "outcome": "recorded-not-sent", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "READ /finance/salaries.csv", "verb": "READ", "decision": "denied", "approver": "-", "path": "/finance/salaries.csv"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "COPY /clients/contract-acme.txt TO /shared", "verb": "COPY", "decision": "denied", "approver": "-", "path": "/clients/contract-acme.txt", "destination": "/shared/contract-acme.txt"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "DELETE /clients/acme-contact.txt", "verb": "DELETE", "decision": "denied", "approver": "-", "path": "/clients/acme-contact.txt"}
 ```
 
 A READ and a SHARE no longer look the same in the log: the SHARE
 line carries `"verb": "SHARE"` and `"recipient": "Ada Lovelace"`,
 while the READ line carries `"verb": "READ"` and no recipient field
-at all.
+at all. And the SHARE now has two lines: the decision says it was
+auto-approved, and the outcome line says it was recorded and
+nothing was sent.
 
 ## The dry run
 
@@ -116,7 +125,7 @@ These were run the same day against temporary policies and a scratch
 copy of the test folder, so the demo folder stayed untouched. The
 tests in `test_hnic.py` cover the same ground and all pass
 (`python3 test_hnic.py` and `python3 -m unittest test_hnic -v` —
-17 tests).
+24 tests).
 
 **A — the approval prompt really asks.** Same demo, no
 `--auto-approve`, with `y` piped into the prompt: the SHARE was
@@ -131,11 +140,13 @@ SHARE /clients/contract-acme.txt WITH Ada Lovelace
 ```
 
 Audit lines from the two runs — the `y` run names the approver, the
-`n` run records the denial, and both name the verb and the recipient:
+`n` run records the denial, and both name the verb and the recipient.
+The `y` run has two SHARE lines: the decision, then the outcome.
 
 ```
-{"timestamp": "2026-11-26T21:32:34", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "approved-by-human", "approver": "root", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
-{"timestamp": "2026-11-26T21:32:34", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "denied", "approver": "-", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-27T17:12:18", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "approved-by-human", "approver": "root", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-27T17:12:18", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "outcome": "recorded-not-sent", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+{"timestamp": "2026-11-27T17:12:18", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "decision": "denied", "approver": "-", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
 ```
 
 **B — the stubs and the checkpoint.** A policy allowing SUMMARIZE,
@@ -256,14 +267,17 @@ RENAME /clients/acme-contact.txt TO acme-contact.txt
   DENIED — destination already exists — refusing to overwrite
 ```
 
-An approval still needs an ALLOW: a policy with REQUIRE approval
-BEFORE SHARE and no ALLOW SHARE rule, run with `--auto-approve` —
-the human approves, and the statement is still denied, because
-approval satisfies the REQUIRE rule, not the ALLOW rule.
+An approval still needs an ALLOW — and now the runtime does not
+even ask. A policy with REQUIRE approval BEFORE SHARE and no ALLOW
+SHARE rule, run with `--auto-approve`: the statement is refused
+before anyone is asked, because the ALLOW check runs before the
+REQUIRE prompt. The decision is the same as before — denied, "no
+rule allows it" — but no human is asked to approve what the policy
+would refuse anyway. The audit log holds exactly one line for it,
+the decision; nothing was attempted, so there is no outcome line.
 
 ```
 SHARE /clients/contract.txt WITH Ada Lovelace
-  (auto-approved for the demo)
   DENIED — no rule allows it
 ```
 
@@ -287,7 +301,7 @@ And a malformed policy line fails closed with a clear one-line
 error, not a traceback:
 
 ```
-hnic: /tmp/regen2/pbad.hnic:1: expected 'ALLOW <verb> [IN <folder>]'
+hnic: /tmp/hnic-regen2/pbad.hnic:1: expected 'ALLOW <verb> [IN <folder>]'
 ```
 
 exit: 2
@@ -305,9 +319,53 @@ forged
 ```
 
 ```
-{"timestamp": "2026-11-26T21:32:42", "statement": "READ \"/clients/x | auto-approved | auto.txt\"", "verb": "READ", "decision": "allowed", "approver": "-", "path": "/clients/x | auto-approved | auto.txt"}
+{"timestamp": "2026-11-27T17:12:38", "statement": "READ \"/clients/x | auto-approved | auto.txt\"", "verb": "READ", "decision": "allowed", "approver": "-", "path": "/clients/x | auto-approved | auto.txt"}
+{"timestamp": "2026-11-27T17:12:38", "statement": "READ \"/clients/x | auto-approved | auto.txt\"", "verb": "READ", "outcome": "done", "path": "/clients/x | auto-approved | auto.txt"}
 ```
 
-Parsed back, that line is one object with exactly six fields —
-`timestamp`, `statement`, `verb`, `decision`, `approver`, `path` —
-and the decision is the real one, `allowed`.
+Parsed back, the decision line is one object with exactly six
+fields — `timestamp`, `statement`, `verb`, `decision`, `approver`,
+`path` — and the decision is the real one, `allowed`. The outcome
+line carries the same path and says `done`. The forged words
+changed nothing in either line, because they were never a column.
+They were a file name, inside a field, where they belong.
+
+**H — the outcome lines, and reading the log back.** The demo run
+above left two outcome lines in `audit.log`, one per action that
+was attempted: the SEARCH says `done`, the SHARE says
+`recorded-not-sent`. The three denied statements have no outcome
+line at all.
+
+```
+{"timestamp": "2026-11-27T17:12:03", "statement": "SEARCH files IN /clients", "verb": "SEARCH", "outcome": "done", "path": "/clients"}
+{"timestamp": "2026-11-27T17:12:03", "statement": "SHARE /clients/contract-acme.txt WITH Ada Lovelace", "verb": "SHARE", "outcome": "recorded-not-sent", "path": "/clients/contract-acme.txt", "recipient": "Ada Lovelace"}
+```
+
+`--read-log` prints the same log in plain words, one sentence per
+line — a decision line says what was decided, an outcome line says
+what happened after:
+
+```
+$ python3 hnic.py --read-log audit.log
+The runtime allowed this: search /clients.
+It happened: the runtime searched /clients.
+Auto-approved for the demo, no human involved: share /clients/contract-acme.txt with Ada Lovelace.
+Recorded, not sent: the runtime recorded share /clients/contract-acme.txt with Ada Lovelace, and nothing was sent.
+The runtime refused this: read /finance/salaries.csv.
+The runtime refused this: copy /clients/contract-acme.txt to /shared/contract-acme.txt.
+The runtime refused this: delete /clients/acme-contact.txt.
+```
+
+A failure gets an outcome line too. With a file named `/archive`
+in the way of the destination folder, an allowed COPY fails, and
+the log holds both halves: the decision already said allowed, so
+the outcome line must say it failed.
+
+```
+COPY /clients/contract.txt TO /archive
+  ALLOWED — policy says ALLOW COPY IN /clients
+  Failed: [Errno 17] File exists: '/tmp/hnic-regen2/htest/archive'
+
+{"timestamp": "2026-11-27T17:12:47", "statement": "COPY /clients/contract.txt TO /archive", "verb": "COPY", "decision": "allowed", "approver": "-", "path": "/clients/contract.txt", "destination": "/archive/contract.txt"}
+{"timestamp": "2026-11-27T17:12:47", "statement": "COPY /clients/contract.txt TO /archive", "verb": "COPY", "outcome": "failed: [Errno 17] File exists: '/tmp/hnic-regen2/htest/archive'", "path": "/clients/contract.txt", "destination": "/archive/contract.txt"}
+```
