@@ -65,6 +65,17 @@ class ToyTestCase(unittest.TestCase):
                  if line.strip()]
         return [json.loads(line) for line in lines]
 
+    def decision_records(self):
+        """Only the decision lines: the first line per statement,
+        naming the decision. An outcome line has no "decision"."""
+        return [r for r in self.log_records() if "decision" in r]
+
+    def outcome_records(self):
+        """Only the outcome lines: the second line per attempted
+        action, naming the outcome. A decision line has no
+        "outcome"."""
+        return [r for r in self.log_records() if "outcome" in r]
+
     def run_line(self, line, rules, execute=True, auto_approve=False,
             approver="tester"):
         """Run one statement, capturing the printed output. The line
@@ -81,6 +92,211 @@ class ToyTestCase(unittest.TestCase):
                                     self.log, execute, auto_approve,
                                     approver)
         return decision, out.getvalue()
+
+    def run_script(self, text, rules, execute=True, auto_approve=False,
+                   approver="tester"):
+        """Run a whole script, capturing the printed output. Returns
+        the list of decisions, in order."""
+        path = os.path.join(self.tmp.name, "script.hnic")
+        write(path, text)
+        statements = hnic.parse_script(path)
+        decisions = []
+        out = io.StringIO()
+        with redirect_stdout(out):
+            for statement in statements:
+                decisions.append(hnic.run_one(
+                    statement, rules, self.root, self.log, execute,
+                    auto_approve, approver))
+        return decisions, out.getvalue()
+
+    def test_no_approval_prompt_without_allow(self):
+        # The new order: DENY, then ALLOW, then REQUIRE. A SHARE
+        # with a REQUIRE rule and no ALLOW rule is refused WITHOUT
+        # asking anyone — the human is never asked to approve what
+        # the policy would refuse anyway.
+        rules = self.rules("REQUIRE approval BEFORE SHARE\n")
+        with mock.patch("builtins.input",
+                        return_value="y") as prompt:
+            decision, out = self.run_line(
+                "SHARE /clients/contract.txt WITH Ada Lovelace",
+                rules, auto_approve=False, approver="Grace")
+        self.assertEqual(decision, "denied")
+        prompt.assert_not_called()
+        self.assertNotIn("Approve?", out)
+        self.assertIn("no rule allows it", out)
+        # One audit line only: the decision. Nothing was attempted,
+        # so there is no outcome line.
+        self.assertEqual(len(self.log_records()), 1)
+        self.assertEqual(self.log_records()[0]["decision"], "denied")
+
+    def test_outcome_lines_for_done_actions(self):
+        # Every allowed action that runs gets a second audit line
+        # recording the outcome "done".
+        os.makedirs(os.path.join(self.root, "archive"))
+        rules = self.rules("ALLOW SEARCH IN /clients\n"
+                           "ALLOW SEARCH IN /archive\n"
+                           "ALLOW READ IN /clients\n"
+                           "ALLOW COPY IN /clients\n"
+                           "ALLOW COPY IN /archive\n"
+                           "ALLOW MOVE IN /clients\n"
+                           "ALLOW MOVE IN /archive\n"
+                           "ALLOW DELETE IN /clients\n"
+                           "ALLOW RENAME IN /clients\n")
+        decisions, _ = self.run_script(
+            "SEARCH files IN /clients\n"
+            "READ /clients/contract.txt\n"
+            "COPY /clients/contract.txt TO /archive\n"
+            "MOVE /clients/contact.txt TO /archive\n"
+            "RENAME /clients/contract.txt TO contract-v2.txt\n"
+            "DELETE /clients/contract-v2.txt\n", rules)
+        self.assertEqual(decisions, ["allowed"] * 6)
+        outcomes = self.outcome_records()
+        self.assertEqual(len(outcomes), 6)
+        self.assertEqual([r["outcome"] for r in outcomes],
+                         ["done"] * 6)
+        self.assertEqual([r["verb"] for r in outcomes],
+                         ["SEARCH", "READ", "COPY", "MOVE", "RENAME",
+                          "DELETE"])
+        # The outcome line carries the same path and destination as
+        # its decision line.
+        copy_outcome = [r for r in outcomes
+                        if r["verb"] == "COPY"][0]
+        self.assertEqual(copy_outcome["path"],
+                         "/clients/contract.txt")
+        self.assertEqual(copy_outcome["destination"],
+                         "/archive/contract.txt")
+        decision_copy = [r for r in self.decision_records()
+                         if r["verb"] == "COPY"][0]
+        self.assertEqual(decision_copy["path"],
+                         copy_outcome["path"])
+        self.assertEqual(decision_copy["destination"],
+                         copy_outcome["destination"])
+
+    def test_outcome_line_share_recorded_not_sent(self):
+        # A SHARE is recorded, not sent: the outcome line says so.
+        rules = self.rules("REQUIRE approval BEFORE SHARE\n"
+                           "ALLOW SHARE IN /clients\n")
+        decision, _ = self.run_line(
+            "SHARE /clients/contract.txt WITH Ada Lovelace",
+            rules, auto_approve=True, approver="Grace")
+        self.assertEqual(decision, "auto-approved")
+        outcomes = self.outcome_records()
+        self.assertEqual(len(outcomes), 1)
+        outcome = outcomes[0]
+        self.assertEqual(outcome["outcome"], "recorded-not-sent")
+        self.assertEqual(outcome["verb"], "SHARE")
+        self.assertEqual(outcome["path"], "/clients/contract.txt")
+        self.assertEqual(outcome["recipient"], "Ada Lovelace")
+        self.assertEqual(outcome["statement"],
+                         "SHARE /clients/contract.txt WITH Ada Lovelace")
+        # The decision line names the same path and recipient.
+        decision_record = self.decision_records()[-1]
+        self.assertEqual(decision_record["path"], outcome["path"])
+        self.assertEqual(decision_record["recipient"],
+                         outcome["recipient"])
+
+    def test_outcome_line_failed(self):
+        # The decision line already said allowed, so the outcome
+        # line must say it failed.
+        rules = self.rules("ALLOW COPY IN /clients\n"
+                           "ALLOW COPY IN /shared\n")
+        with mock.patch("shutil.copy2",
+                        side_effect=OSError("disk full")):
+            decision, out = self.run_line(
+                "COPY /clients/contract.txt TO /shared", rules)
+        self.assertEqual(decision, "allowed")
+        self.assertIn("Failed: disk full", out)
+        outcomes = self.outcome_records()
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["outcome"], "failed: disk full")
+        self.assertEqual(outcomes[0]["path"], "/clients/contract.txt")
+        self.assertEqual(outcomes[0]["destination"],
+                         "/shared/contract.txt")
+
+    def test_outcome_line_not_done_no_model(self):
+        # SUMMARIZE and EXTRACT pass the policy check, then stop:
+        # the model is not here, so the outcome is not-done-no-model.
+        rules = self.rules("ALLOW SUMMARIZE IN /clients\n"
+                           "ALLOW EXTRACT IN /clients\n")
+        for line in ("SUMMARIZE /clients/contract.txt",
+                     "EXTRACT /clients/contract.txt"):
+            decision, _ = self.run_line(line, rules)
+            self.assertEqual(decision, "needs-model", line)
+        outcomes = self.outcome_records()
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual([r["outcome"] for r in outcomes],
+                         ["not-done-no-model"] * 2)
+        self.assertEqual([r["verb"] for r in outcomes],
+                         ["SUMMARIZE", "EXTRACT"])
+
+    def test_no_outcome_line_when_nothing_was_attempted(self):
+        # Denied, dry-run, and needs-approval decisions get no
+        # outcome line — nothing was attempted.
+        rules = self.rules("ALLOW COPY IN /clients\n"
+                           "ALLOW COPY IN /shared\n"
+                           "REQUIRE approval BEFORE SHARE\n"
+                           "ALLOW SHARE IN /clients\n"
+                           "DENY DELETE\n")
+        decision, _ = self.run_line(
+            "DELETE /clients/contract.txt", rules)
+        self.assertEqual(decision, "denied")
+        decision, _ = self.run_line(
+            "COPY /clients/contract.txt TO /shared", rules,
+            execute=False)
+        self.assertEqual(decision, "dry-run:allowed")
+        decision, _ = self.run_line(
+            "SHARE /clients/contract.txt WITH Ada Lovelace",
+            rules, execute=False)
+        self.assertEqual(decision, "dry-run:needs-approval")
+        self.assertEqual(self.outcome_records(), [])
+        self.assertEqual(len(self.decision_records()), 3)
+
+    def test_read_log_mode(self):
+        # --read-log prints the log in plain words, one sentence
+        # per line, and skips a malformed line with a plain note
+        # instead of crashing.
+        log_path = os.path.join(self.tmp.name, "sample.log")
+        write(log_path,
+              '{"timestamp": "2026-11-27T12:00:00", "statement": '
+              '"SHARE /clients/contract.txt WITH Ada Lovelace", '
+              '"verb": "SHARE", "decision": "auto-approved", '
+              '"approver": "auto", "path": "/clients/contract.txt", '
+              '"recipient": "Ada Lovelace"}\n'
+              '{"timestamp": "2026-11-27T12:00:01", "statement": '
+              '"SHARE /clients/contract.txt WITH Ada Lovelace", '
+              '"verb": "SHARE", "outcome": "recorded-not-sent", '
+              '"path": "/clients/contract.txt", '
+              '"recipient": "Ada Lovelace"}\n'
+              'this is not json\n'
+              '{"timestamp": "2026-11-27T12:00:02", "statement": '
+              '"READ /finance/salaries.csv", "verb": "READ", '
+              '"decision": "denied", "approver": "-", '
+              '"path": "/finance/salaries.csv"}\n')
+        result = subprocess.run(
+            [sys.executable, HNIC, "--read-log", log_path],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        out = result.stdout
+        self.assertIn("Auto-approved for the demo, no human involved: "
+                      "share /clients/contract.txt with Ada Lovelace.",
+                      out)
+        self.assertIn("Recorded, not sent: the runtime recorded share "
+                      "/clients/contract.txt with Ada Lovelace, and "
+                      "nothing was sent.", out)
+        self.assertIn("Skipped: line 3 is not a readable audit line.",
+                      out)
+        self.assertIn("The runtime refused this: "
+                      "read /finance/salaries.csv.", out)
+        self.assertNotIn("Traceback", result.stderr)
+
+        # A missing log file fails cleanly, not with a traceback.
+        missing = subprocess.run(
+            [sys.executable, HNIC, "--read-log",
+             os.path.join(self.tmp.name, "nope.log")],
+            capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("hnic: cannot read log file", missing.stderr)
+        self.assertNotIn("Traceback", missing.stderr)
 
     def test_dotdot_bypass_denied(self):
         # Problem 1: READ /clients/../finance/salaries.csv must be
@@ -153,13 +369,15 @@ class ToyTestCase(unittest.TestCase):
             "SHARE /clients/contract.txt WITH Ada Lovelace",
             rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
-        records = self.log_records()
+        records = self.decision_records()
         self.assertEqual(records[-1]["decision"], "auto-approved")
         self.assertEqual(records[-1]["approver"], "auto")
         self.assertNotIn("Grace", self.log.getvalue())
 
-        # The log line is written BEFORE the action: even when the
-        # action then fails, the record is already there.
+        # The decision line is written BEFORE the action: even when
+        # the action then fails, the record is already there — and
+        # a second line now records the outcome, so the log says
+        # what happened, not just what was decided.
         rules = self.rules("ALLOW COPY IN /clients\n"
                            "ALLOW COPY IN /shared\n")
         before = len(self.log_records())
@@ -170,12 +388,17 @@ class ToyTestCase(unittest.TestCase):
         self.assertEqual(decision, "allowed")
         self.assertIn("Failed: disk full", out)
         records = self.log_records()[before:]
-        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records), 2)
         self.assertEqual(records[0]["path"],
                          "/clients/contract.txt")
         self.assertEqual(records[0]["destination"],
                          "/shared/contract.txt")
         self.assertEqual(records[0]["decision"], "allowed")
+        self.assertEqual(records[1]["outcome"], "failed: disk full")
+        self.assertEqual(records[1]["path"],
+                         "/clients/contract.txt")
+        self.assertEqual(records[1]["destination"],
+                         "/shared/contract.txt")
         self.assertFalse(os.path.exists(
             os.path.join(self.root, "shared", "contract.txt")))
 
@@ -191,7 +414,8 @@ class ToyTestCase(unittest.TestCase):
                 "SHARE /clients/contract.txt WITH Ada Lovelace",
                 rules, approver="Grace")
         self.assertEqual(decision, "approved-by-human")
-        self.assertEqual(self.log_records()[-1]["approver"], "Grace")
+        self.assertEqual(self.decision_records()[-1]["approver"],
+                         "Grace")
         with mock.patch("builtins.input", return_value="n"):
             decision, _ = self.run_line(
                 "SHARE /clients/contract.txt WITH Ada Lovelace",
@@ -337,7 +561,7 @@ class ToyTestCase(unittest.TestCase):
         decision, _ = self.run_line(
             "COPY /clients/../clients/contract.txt TO /shared", rules)
         self.assertEqual(decision, "allowed")
-        record = self.log_records()[-1]
+        record = self.decision_records()[-1]
         self.assertEqual(record["path"], "/clients/contract.txt")
         self.assertEqual(record["destination"],
                          "/shared/contract.txt")
@@ -354,7 +578,7 @@ class ToyTestCase(unittest.TestCase):
             "SHARE /clients/contract.txt WITH Ada Lovelace",
             rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
-        record = self.log_records()[-1]
+        record = self.decision_records()[-1]
         self.assertEqual(record["decision"], "auto-approved")
         self.assertEqual(record["approver"], "auto")
         self.assertNotIn("Grace", self.log.getvalue())
@@ -363,7 +587,8 @@ class ToyTestCase(unittest.TestCase):
                 "SHARE /clients/contract.txt WITH Ada Lovelace",
                 rules, approver="Grace")
         self.assertEqual(decision, "approved-by-human")
-        self.assertEqual(self.log_records()[-1]["approver"], "Grace")
+        self.assertEqual(self.decision_records()[-1]["approver"],
+                         "Grace")
 
     def test_approval_still_needs_allow(self):
         # An approval satisfies the REQUIRE rule, not the ALLOW
@@ -453,7 +678,7 @@ class ToyTestCase(unittest.TestCase):
             "SHARE /clients/contract.txt WITH Ada Lovelace",
             rules, auto_approve=True, approver="Grace")
         self.assertEqual(decision, "auto-approved")
-        share = self.log_records()[-1]
+        share = self.decision_records()[-1]
         self.assertEqual(share["verb"], "SHARE")
         self.assertEqual(share["path"], "/clients/contract.txt")
         self.assertEqual(share["recipient"], "Ada Lovelace")
@@ -463,7 +688,7 @@ class ToyTestCase(unittest.TestCase):
         decision, _ = self.run_line(
             "READ /clients/contract.txt", rules)
         self.assertEqual(decision, "allowed")
-        read = self.log_records()[-1]
+        read = self.decision_records()[-1]
         self.assertEqual(read["verb"], "READ")
         self.assertEqual(read["path"], "/clients/contract.txt")
         self.assertNotIn("recipient", read)
@@ -484,9 +709,9 @@ class ToyTestCase(unittest.TestCase):
         self.assertIn("weird", out)
         lines = [line for line in self.log.getvalue().splitlines()
                  if line.strip()]
-        # Exactly one audit line for this statement, and it parses
-        # as exactly one JSON object.
-        self.assertEqual(len(lines), 1)
+        # Two audit lines for this statement: the decision, then
+        # the outcome. Both parse as exactly one JSON object.
+        self.assertEqual(len(lines), 2)
         record = json.loads(lines[0])
         self.assertEqual(record["verb"], "READ")
         self.assertEqual(record["path"], "/clients/" + name)
@@ -497,6 +722,14 @@ class ToyTestCase(unittest.TestCase):
                          {"timestamp", "statement", "verb", "path",
                           "decision", "approver"})
         self.assertEqual(record["statement"], line)
+        # The outcome line says the read happened, and carries the
+        # same path — the forged text is string content there too.
+        outcome = json.loads(lines[1])
+        self.assertEqual(outcome["outcome"], "done")
+        self.assertEqual(outcome["verb"], "READ")
+        self.assertEqual(outcome["path"], "/clients/" + name)
+        self.assertEqual(outcome["statement"], line)
+        self.assertNotIn("decision", outcome)
 
 
 if __name__ == "__main__":
